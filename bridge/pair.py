@@ -68,10 +68,13 @@ def main(argv=None) -> int:
     parser.add_argument("--code", help="Código de emparejamiento de 6 dígitos")
     parser.add_argument("--name", help="Nombre de esta GPU en la app "
                                        "(default: hostname + SO)")
+    parser.add_argument("--yes", action="store_true",
+                        help="No preguntar al re-emparejar (para el "
+                             "instalador y scripts no interactivos)")
     args = parser.parse_args(argv)
 
     existing = config.load()
-    if existing.paired:
+    if existing.paired and not args.yes:
         print("⚠️  Esta máquina ya está emparejada con "
               f"{existing.back_url} (worker {existing.worker_id[:8]}…).")
         if input("¿Re-emparejar y reemplazar? (s/N): ").strip().lower() not in ("s", "si", "sí", "y"):
@@ -89,8 +92,14 @@ def main(argv=None) -> int:
         print(f"❌ El código debe tener 6 dígitos (recibido: {code!r})")
         return 2
 
-    name = args.name or _prompt("Nombre de esta GPU (opcional)",
-                                existing.worker_name or machine_name())
+    if args.name:
+        name = args.name
+    elif args.yes or not sys.stdin.isatty():
+        # Sin terminal (instalador/GUI): no hay a quién preguntar.
+        name = existing.worker_name or machine_name()
+    else:
+        name = _prompt("Nombre de esta GPU (opcional)",
+                       existing.worker_name or machine_name())
 
     print(f"\nConectando con {back}…")
     try:

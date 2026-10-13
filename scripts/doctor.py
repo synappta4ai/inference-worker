@@ -70,12 +70,18 @@ def check_ram() -> None:
     try:
         import psutil
         total_gb = psutil.virtual_memory().total / (1024 ** 3)
-        if total_gb >= 16:
-            check("RAM", OK, f"{total_gb:.0f} GB")
-        elif total_gb >= 8:
-            check("RAM", WARN, f"{total_gb:.0f} GB (los modelos 14B necesitan ≥16 GB)")
+        # Umbrales en GiB con margen: una máquina "8 GB" reporta ~7,9 GiB
+        # (y "16 GB" ~15,9) — sin margen, las de 8 GB caían a FAIL pese a
+        # que el propio aviso ya decía que sirven para modelos chicos.
+        if total_gb >= 15.5:
+            check("RAM", OK, f"{total_gb:.1f} GB")
+        elif total_gb >= 7.5:
+            check("RAM", WARN,
+                  f"{total_gb:.1f} GB (los modelos 14B necesitan ≥16 GB; "
+                  "con estos alcanza para 1.3B/7B)")
         else:
-            check("RAM", BAD, f"{total_gb:.0f} GB — insuficiente; probá modelos 1.3B")
+            check("RAM", BAD, f"{total_gb:.1f} GB — insuficiente "
+                              "(hacen falta 8 GB)")
     except ImportError:
         check("RAM", WARN, "psutil ausente (se instala con requirements.txt)")
 

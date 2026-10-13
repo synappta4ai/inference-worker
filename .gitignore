@@ -38,3 +38,8 @@ temp/
 
 # Caché de pytest
 .pytest_cache/
+
+# Salida de PyInstaller (SynaptaWorker-Setup.exe)
+dist/
+build/
+*.spec
