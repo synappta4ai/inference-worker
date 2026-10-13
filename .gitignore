@@ -1,0 +1,40 @@
+# Python Inference Worker .gitignore
+
+# Byte-compiled / optimizados
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Pesos de modelos de IA y checkpoints pesados
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.gguf
+
+# Caché de HuggingFace y PyTorch
+.cache/
+huggingface/
+checkpoints/
+
+# Salidas de render y datos temporales
+outputs/
+temp/
+*.log
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints
+
+# Caché de pytest
+.pytest_cache/

@@ -1,0 +1,81 @@
+SYNAPTA SOURCE-AVAILABLE COMMERCIAL LICENSE v1.0
+
+Copyright (c) 2026 synappta4ai. All rights reserved.
+
+This license governs the use, modification and distribution of the Synapta
+software and its associated documentation (the "Software").
+
+1. DEFINITIONS
+   a. "Software" means any and all source code, binaries, configuration,
+      documentation and assets distributed under this license.
+   b. "Licensee" means any individual or legal entity that receives the
+      Software under this license.
+   c. "Service" means any hosted or on-premises application that makes the
+      functionality of the Software available to end users over a network.
+   d. "Competing Offering" means any product or service whose primary
+      purpose is to provide functionality substantially similar to that of
+      the Software to third parties.
+
+2. GRANT
+   Subject to the terms of this license, synappta4ai grants the Licensee a
+   worldwide, non-exclusive, non-transferable, revocable license to:
+   a. use the Software for the Licensee's own internal business, personal
+      or commercial purposes;
+   b. modify the Software for the Licensee's own use;
+   c. sell, sublicense or otherwise commercialize the Software, either as
+      a hosted Service or as bundled software, provided that any such
+      commercialization is not a Competing Offering as defined in 3.a.
+
+3. RESTRICTIONS
+   The Licensee may NOT:
+   a. distribute, publish, or make available the Software (modified or
+      unmodified, in whole or in part) as a Competing Offering, including
+      by offering it as a hosted service, a template, a starter kit, an
+      API, or a downloadable package to third parties;
+   b. distribute, sell, sublicense or redistribute the source code,
+      binaries or assets of the Software to any third party, except as
+      strictly necessary for the use of a Service under section 2.c and
+      under an agreement that imposes at least the restrictions of this
+      license on the end user;
+   c. remove, obscure or alter any copyright notice, trademark or license
+      notice contained in the Software;
+   d. use the name, trademarks or branding of synappta4ai to endorse or
+      promote products or services derived from the Software without
+      prior written permission;
+   e. reverse engineer or attempt to derive the source code of the
+      Software except to the extent that such activity is permitted by
+      applicable law notwithstanding this restriction.
+
+4. INTELLECTUAL PROPERTY
+   All intellectual property rights in and to the Software remain
+   exclusively with synappta4ai. This license does not grant any right to
+   use synappta4ai's trade secrets, trademarks or trade dress. Any code
+   contributed to the Software by a third party is licensed under this
+   same license and remains subject to the restrictions in section 3.
+
+5. TERMINATION
+   This license terminates automatically if the Licensee breaches any of
+   its terms. Upon termination, the Licensee must cease all use of the
+   Software and destroy all copies in its possession. Sections 4, 6 and 7
+   survive termination.
+
+6. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL SYNAPPTA4AI BE LIABLE FOR ANY CLAIM,
+   DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH
+   THE SOFTWARE OR ITS USE.
+
+7. LIMITATION OF LIABILITY
+   IN NO EVENT SHALL SYNAPPTA4AI BE LIABLE FOR ANY INDIRECT, INCIDENTAL,
+   SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES, OR FOR ANY LOSS OF DATA,
+   REVENUE OR PROFITS, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+8. GOVERNING LAW
+   This license is governed by the laws applicable to the jurisdiction in
+   which synappta4ai operates, without regard to conflict-of-law
+   provisions.
+
+By using the Software, the Licensee acknowledges that it has read this
+license and agrees to be bound by its terms.
