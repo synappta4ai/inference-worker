@@ -22,6 +22,17 @@ service InferenceService {
   
   // Catálogo de modelos disponibles (motores, VRAM, disponibilidad)
   rpc ListModels (ListModelsRequest) returns (ListModelsResponse);
+
+  // Gestión de pesos: descarga en segundo plano (el progreso se lee con
+  // GetModelState o en el campo download_* de ModelInfo de ListModels).
+  // cancel=true aborta la descarga en curso de esa clave.
+  rpc DownloadModel (DownloadModelRequest) returns (ModelOperationResponse);
+
+  // Borrado de los pesos en disco de un modelo (libera el disco)
+  rpc DeleteModel (DeleteModelRequest) returns (ModelOperationResponse);
+
+  // Disponibilidad: estado de descarga de un modelo (clave vacía = todos)
+  rpc GetModelState (GetModelStateRequest) returns (GetModelStateResponse);
 }
 
 message ListModelsRequest {}
@@ -36,14 +47,48 @@ message ModelInfo {
   int32 steps = 7;
   int32 vram_gb = 8;
   string family = 9;
-  bool available = 10;    // false si requiere volumen V1 no montado
+  bool available = 10;    // listo para generar YA (pesos en disco; + volumen V1 montado si aplica)
   string notes = 11;
+  bool downloaded = 12;   // pesos completos en disco (no se vuelve a bajar)
+  bool downloading = 13;  // descarga en curso ahora mismo
+  float download_percent = 14; // 0..100 mientras descarga
+  int64 size_bytes = 15;  // bytes ocupados en disco (0 si no está)
+  string download_error = 16; // último error de descarga/borrado
 }
 
 message ListModelsResponse {
   repeated ModelInfo models = 1;
   string device_name = 2;
   bool cuda_available = 3;
+}
+
+// Resultado de una operación de gestión de pesos (descarga / borrado).
+message ModelOperationResponse {
+  string key = 1;
+  // "idle" | "downloading" | "ready" | "failed" | "deleted"
+  string state = 2;
+  float progress = 3;       // 0..100
+  int64 bytes_downloaded = 4;
+  int64 total_bytes = 5;
+  string error = 6;         // vacío si no hubo error
+}
+
+message DownloadModelRequest {
+  string key = 1;           // clave del catálogo (engines/base.py)
+  bool cancel = 2;           // true = abortar la descarga en curso
+}
+
+message DeleteModelRequest {
+  string key = 1;
+}
+
+message GetModelStateRequest {
+  string key = 1;           // vacío = estado de todos los modelos
+}
+
+message GetModelStateResponse {
+  repeated ModelOperationResponse states = 1;
+  int64 bytes_on_disk = 2;   // peso total de los pesos descargados
 }
 
 message MediaGenerationRequest {

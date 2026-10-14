@@ -64,6 +64,21 @@ class InferenceServiceStub:
                 request_serializer=inference__pb2.ListModelsRequest.SerializeToString,
                 response_deserializer=inference__pb2.ListModelsResponse.FromString,
                 _registered_method=True)
+        self.DownloadModel = channel.unary_unary(
+                '/maestro.inference.v1.InferenceService/DownloadModel',
+                request_serializer=inference__pb2.DownloadModelRequest.SerializeToString,
+                response_deserializer=inference__pb2.ModelOperationResponse.FromString,
+                _registered_method=True)
+        self.DeleteModel = channel.unary_unary(
+                '/maestro.inference.v1.InferenceService/DeleteModel',
+                request_serializer=inference__pb2.DeleteModelRequest.SerializeToString,
+                response_deserializer=inference__pb2.ModelOperationResponse.FromString,
+                _registered_method=True)
+        self.GetModelState = channel.unary_unary(
+                '/maestro.inference.v1.InferenceService/GetModelState',
+                request_serializer=inference__pb2.GetModelStateRequest.SerializeToString,
+                response_deserializer=inference__pb2.GetModelStateResponse.FromString,
+                _registered_method=True)
 
 
 class InferenceServiceServicer:
@@ -111,6 +126,29 @@ class InferenceServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DownloadModel(self, request, context):
+        """Gestión de pesos: descarga en segundo plano (el progreso se lee con
+        GetModelState o en el campo download_* de ModelInfo de ListModels).
+        cancel=true aborta la descarga en curso de esa clave.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteModel(self, request, context):
+        """Borrado de los pesos en disco de un modelo (libera el disco)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetModelState(self, request, context):
+        """Disponibilidad: estado de descarga de un modelo (clave vacía = todos)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_InferenceServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -143,6 +181,21 @@ def add_InferenceServiceServicer_to_server(servicer, server):
                     servicer.ListModels,
                     request_deserializer=inference__pb2.ListModelsRequest.FromString,
                     response_serializer=inference__pb2.ListModelsResponse.SerializeToString,
+            ),
+            'DownloadModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.DownloadModel,
+                    request_deserializer=inference__pb2.DownloadModelRequest.FromString,
+                    response_serializer=inference__pb2.ModelOperationResponse.SerializeToString,
+            ),
+            'DeleteModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteModel,
+                    request_deserializer=inference__pb2.DeleteModelRequest.FromString,
+                    response_serializer=inference__pb2.ModelOperationResponse.SerializeToString,
+            ),
+            'GetModelState': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetModelState,
+                    request_deserializer=inference__pb2.GetModelStateRequest.FromString,
+                    response_serializer=inference__pb2.GetModelStateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -307,6 +360,87 @@ class InferenceService:
             '/maestro.inference.v1.InferenceService/ListModels',
             inference__pb2.ListModelsRequest.SerializeToString,
             inference__pb2.ListModelsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DownloadModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/maestro.inference.v1.InferenceService/DownloadModel',
+            inference__pb2.DownloadModelRequest.SerializeToString,
+            inference__pb2.ModelOperationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/maestro.inference.v1.InferenceService/DeleteModel',
+            inference__pb2.DeleteModelRequest.SerializeToString,
+            inference__pb2.ModelOperationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/maestro.inference.v1.InferenceService/GetModelState',
+            inference__pb2.GetModelStateRequest.SerializeToString,
+            inference__pb2.GetModelStateResponse.FromString,
             options,
             channel_credentials,
             insecure,

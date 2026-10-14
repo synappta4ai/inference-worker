@@ -30,6 +30,7 @@ import inference_pb2_grpc
 from vram_manager import VRAMManager
 from engines.base import EngineContext, resolve
 from engines import registry
+from model_ops import ModelOps
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("BrainMasterInferenceWorker")
@@ -45,6 +46,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         # job_id -> asyncio.Event para cancelación cooperativa
         self._active: dict[str, asyncio.Event] = {}
         self._cancel_done: dict[str, bool] = {}
+        self.ops = ModelOps()
 
     # ------------------------------------------------------------------
     # GenerateMedia: streaming de progreso + archivo de salida real
@@ -139,6 +141,14 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
             cuda_available=cuda,
         )
         for m in registry.list_models():
+            state = self.ops.snapshot(m["id"])
+            if m["engine"] == "v1_bridge":
+                available = is_available()
+            elif m["engine"] == "diffusers":
+                # Listo para generar YA: los pesos completos ya están en disco.
+                available = state.downloaded
+            else:
+                available = True
             info = inference_pb2.ModelInfo(
                 key=m["id"],
                 label=m["name"],
@@ -150,10 +160,74 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
                 vram_gb=int(m.get("vram_gb") or 0),
                 family=m["family"],
                 notes=m.get("notes") or "",
-                available=(m["engine"] != "v1_bridge") or is_available(),
+                available=available,
+                downloaded=state.downloaded,
+                downloading=state.downloading,
+                download_percent=float(state.progress),
+                size_bytes=int(state.size_bytes),
+                download_error=state.error,
             )
             resp.models.append(info)
         logger.info("[ListModels] %d modelos | device=%s", len(resp.models), tel["device_name"])
+        return resp
+
+    # ------------------------------------------------------------------
+    # Gestión de pesos del panel "Tu GPU"
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _operation_response(state) -> "inference_pb2.ModelOperationResponse":
+        return inference_pb2.ModelOperationResponse(
+            key=state.key,
+            state=state.state,
+            progress=float(state.progress),
+            bytes_downloaded=int(state.bytes_downloaded),
+            total_bytes=int(state.total_bytes),
+            error=state.error,
+        )
+
+    @staticmethod
+    def _model_key(raw_key: str | None) -> str:
+        key = (raw_key or "").strip()
+        return key
+
+    async def DownloadModel(self, request, context):
+        key = self._model_key(request.key)
+        if not key:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "key requerido")
+        try:
+            state = self.ops.cancel(key) if request.cancel else self.ops.start_download(key)
+        except KeyError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"modelo desconocido: {key}")
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        logger.info("[DownloadModel] %s cancel=%s estado=%s", key, bool(request.cancel), state.state)
+        return self._operation_response(state)
+
+    async def DeleteModel(self, request, context):
+        key = self._model_key(request.key)
+        if not key:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "key requerido")
+        try:
+            state = self.ops.delete(key)
+        except KeyError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"modelo desconocido: {key}")
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
+        logger.info("[DeleteModel] %s estado=%s", key, state.state)
+        return self._operation_response(state)
+
+    async def GetModelState(self, request, context):
+        key = self._model_key(request.key)
+        try:
+            states = self.ops.states(key)
+        except KeyError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"modelo desconocido: {key}")
+        resp = inference_pb2.GetModelStateResponse(
+            bytes_on_disk=int(self.ops.disk_total()),
+        )
+        for state in states:
+            resp.states.append(self._operation_response(state))
+        logger.info("[GetModelState] key=%s estados=%d", key or "todos", len(resp.states))
         return resp
 
     # ------------------------------------------------------------------
