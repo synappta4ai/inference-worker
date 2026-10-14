@@ -106,11 +106,29 @@ def payload_source(explicit: Optional[Path] = None) -> Path:
     return tmp
 
 
-def extract_payload(zip_path: Path, target: Path) -> None:
+def extract_payload(zip_path: Path, target: Path, retries: int = 6) -> None:
+    """Extrae el payload con reintentos ante bloqueos de antivirus.
+
+    El .exe onefile de PyInstaller extrae `_payload.zip` a un temporal
+    (`_MEI…`) y Defender suele bloquearlo unos segundos para escanearlo:
+    sin reintentos el Paso 1 moría con `[Errno 13] Permission denied`.
+    """
     target.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(target)
-    logger.info("código extraído en %s", target)
+    for attempt in range(retries):
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(target)
+            logger.info("código extraído en %s", target)
+            return
+        except PermissionError:
+            if attempt + 1 >= retries:
+                raise RuntimeError(
+                    f"permiso denegado leyendo {zip_path}: el antivirus está "
+                    "bloqueando el instalador. Pausá la protección en tiempo "
+                    "real un momento y reintentá") from None
+            logger.warning("instalador bloqueado (antivirus?), reintento %d/%d…",
+                           attempt + 1, retries)
+            time.sleep(3)
 
 
 # ── paths locales ─────────────────────────────────────────────────

@@ -71,6 +71,47 @@ def test_extract_payload_roundtrip(tmp_path):
     assert (target / "run.py").read_text(encoding="utf-8") == "print('ok')\n"
 
 
+def test_extract_payload_retries_av_lock(tmp_path, monkeypatch):
+    """El antivirus bloquea el zip recién extraído: reintenta y sale."""
+    repo = tmp_path / "repo"
+    _make_repo(repo, {"run.py": "print('ok')\n"})
+    zip_path = tmp_path / "p.zip"
+    core.build_payload(repo, zip_path)
+
+    real_zipfile = zipfile.ZipFile
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "Permission denied", str(args[0]))
+        return real_zipfile(*args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", flaky)
+    monkeypatch.setattr(core.time, "sleep", lambda *a: None)
+
+    target = tmp_path / "install" / "worker"
+    core.extract_payload(zip_path, target)
+    assert (target / "run.py").read_text(encoding="utf-8") == "print('ok')\n"
+    assert calls["n"] == 3
+
+
+def test_extract_payload_gives_up_with_hint(tmp_path, monkeypatch):
+    """Si el bloqueo persiste, el error dice qué hacer (antivirus)."""
+    repo = tmp_path / "repo"
+    _make_repo(repo, {"run.py": "print('ok')\n"})
+    zip_path = tmp_path / "p.zip"
+    core.build_payload(repo, zip_path)
+
+    def locked(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(args[0]))
+
+    monkeypatch.setattr(zipfile, "ZipFile", locked)
+    monkeypatch.setattr(core.time, "sleep", lambda *a: None)
+    with pytest.raises(RuntimeError, match="antivirus"):
+        core.extract_payload(tmp_path / "p.zip", tmp_path / "install")
+
+
 # ── python embeddable ─────────────────────────────────────────────
 def test_patch_pth_enables_site(tmp_path):
     pth = tmp_path / "python312._pth"

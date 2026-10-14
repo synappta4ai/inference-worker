@@ -15,4 +15,4 @@ Piezas:
 # Versión del agente bridge; viaja en el heartbeat para que el back detecte
 # workers desactualizados antes de un rollout (riesgo "versiones mezcladas"
 # del plan).
-BRIDGE_VERSION = "0.2.1"
+BRIDGE_VERSION = "0.2.2"
