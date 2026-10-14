@@ -92,7 +92,8 @@ class TestInspectRepo:
     def test_partial_blob_is_not_ready(self, tmp_path, monkeypatch):
         cache = use_demo_cache(tmp_path, monkeypatch)
         write_repo_tree(cache, {"model.safetensors": 32, "config.json": 4})
-        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "config.json")
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "config.json",
+                         content=b"x" * 4)
         write_cache_file(
             cache,
             "models--org--demo",
@@ -105,7 +106,12 @@ class TestInspectRepo:
 
         assert state.state == model_ops.IDLE
         assert state.downloaded is False
-        assert 0.0 < state.progress < 100.0
+        # El blob a medio bajar es un REST0 de un intento que ya no corre: no
+        # cuenta para el porcentaje ni para el tamaño del panel. Sólo los 4
+        # bytes del config.json completo están de verdad en disco.
+        assert state.bytes_downloaded == 4
+        assert state.size_bytes == 4
+        assert state.progress == pytest.approx(100.0 * 4 / 36)
 
     def test_unknown_key_raises(self, tmp_path, monkeypatch):
         use_demo_cache(tmp_path, monkeypatch)
@@ -174,6 +180,190 @@ class TestDownloadLifecycle:
         assert cancelled.state in {model_ops.IDLE, model_ops.DOWNLOADING}
         assert wait_for(lambda: not ops._running(ops._ops["demo"]))
         assert ops.snapshot("demo").state == model_ops.IDLE
+
+    def test_live_attempt_counts_its_own_partial_bytes(self, tmp_path, monkeypatch):
+        """Mientras la descarga corre, sus bytes a medio bajar SÍ son progreso."""
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        write_repo_tree(cache, {"model.safetensors": 32, "config.json": 4})
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "config.json",
+                         content=b"x" * 4)
+        stop = threading.Event()
+
+        def alive(repo, tqdm_class=None, max_workers=None):
+            # Los bytes a medio bajar de ESTE intento los escribe la descarga.
+            write_cache_file(
+                cache, "models--org--demo", "blobs", f"{0:064x}.live.incomplete",
+                content=b"x" * 8,
+            )
+            stop.wait(5)
+
+        monkeypatch.setattr(model_ops, "snapshot_download", alive)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        blobs = cache / "models--org--demo" / "blobs"
+        assert wait_for(lambda: list(blobs.glob("*.incomplete")))
+
+        try:
+            state = ops.snapshot("demo")
+
+            assert state.downloading is True
+            assert state.bytes_downloaded == 4 + 8
+            assert state.size_bytes == 4 + 8
+            assert state.progress == pytest.approx(100.0 * 12 / 36)
+        finally:
+            stop.set()
+            assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
+    def test_cancel_stops_a_transfer_that_never_touches_the_bar(self, tmp_path, monkeypatch):
+        """Camino Xet: los bytes los mueve Rust y el hilo está bloqueado ahí.
+
+        La barra de tqdm nunca recibe la señal, así que cancelar tiene que
+        pedir el aborto de las transferencias en vuelo o la descarga sigue.
+        """
+        use_demo_cache(tmp_path, monkeypatch)
+        aborts: list[int] = []
+
+        def fake_abort() -> bool:
+            aborts.append(1)
+            return True
+
+        monkeypatch.setattr(model_ops, "_abort_inflight_transfers", fake_abort)
+
+        def xet_download(repo, tqdm_class=None, max_workers=None):
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if aborts:
+                    # El aborto de Xet sale por el camino de Ctrl-C.
+                    raise KeyboardInterrupt("transferencia abortada")
+                time.sleep(0.01)
+            raise AssertionError("la cancelación no cortó la transferencia Xet")
+
+        monkeypatch.setattr(model_ops, "snapshot_download", xet_download)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        assert wait_for(lambda: ops._running(ops._ops["demo"]))
+
+        cancelled = ops.cancel("demo")
+
+        assert aborts, "cancel() no abortó las transferencias Xet en vuelo"
+        assert cancelled.error == ""
+        assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+        final = ops.snapshot("demo")
+        assert final.state == model_ops.IDLE
+        assert final.bytes_downloaded == 0
+        assert final.size_bytes == 0
+
+    def test_cancel_discards_partial_bytes_and_keeps_complete_files(
+            self, tmp_path, monkeypatch):
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        write_repo_tree(cache, {"model.safetensors": 32, "config.json": 4})
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "config.json",
+                         content=b"x" * 4)
+        blobs = cache / "models--org--demo" / "blobs"
+
+        def slow_download(repo, tqdm_class=None, max_workers=None):
+            write_cache_file(
+                cache, "models--org--demo", "blobs",
+                f"{0:064x}.abc123.incomplete", content=b"x" * 8,
+            )
+            bar = tqdm_class(total=1, desc="cancel-leftovers")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                bar.update(1)
+                time.sleep(0.01)
+            raise AssertionError("la cancelación no abortó la descarga")
+
+        monkeypatch.setattr(model_ops, "snapshot_download", slow_download)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        assert wait_for(lambda: list(blobs.glob("*.incomplete")))
+
+        ops.cancel("demo")
+        assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
+        assert not list(blobs.glob("*.incomplete"))  # sin restos
+        assert (cache / "models--org--demo" / "snapshots" / "rev"
+                / "config.json").is_file()  # los pesos completos no se tocan
+        state = ops.snapshot("demo")
+        assert state.bytes_downloaded == 4
+        assert state.size_bytes == 4
+
+    def test_failed_download_discards_partial_bytes(self, tmp_path, monkeypatch):
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        write_repo_tree(cache, {"model.safetensors": 32, "config.json": 4})
+        blobs = cache / "models--org--demo" / "blobs"
+
+        def boom(repo, tqdm_class=None, max_workers=None):
+            write_cache_file(
+                cache, "models--org--demo", "blobs",
+                f"{0:064x}.deadbeef.incomplete", content=b"x" * 8,
+            )
+            raise RuntimeError("red caída")
+
+        monkeypatch.setattr(model_ops, "snapshot_download", boom)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
+        state = ops.snapshot("demo")
+
+        assert state.state == model_ops.FAILED
+        assert "red caída" in state.error
+        assert not list(blobs.glob("*.incomplete"))
+        assert state.bytes_downloaded == 0
+        assert state.size_bytes == 0
+
+    def test_start_download_discards_leftovers_of_a_dead_attempt(
+            self, tmp_path, monkeypatch):
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        blobs = cache / "models--org--demo" / "blobs"
+        write_cache_file(
+            cache, "models--org--demo", "blobs",
+            f"{1:064x}.oldattempt.incomplete", content=b"x" * 4096,
+        )
+        started = threading.Event()
+
+        def wait_download(repo, tqdm_class=None, max_workers=None):
+            started.set()
+            time.sleep(0.3)
+
+        monkeypatch.setattr(model_ops, "snapshot_download", wait_download)
+        ops = model_ops.ModelOps()
+
+        ops.start_download("demo")
+
+        assert started.wait(timeout=5)
+        assert not list(blobs.glob("*.incomplete"))
+        assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
+    def test_attempt_killed_by_a_foreign_abort_is_retryable(self, tmp_path, monkeypatch):
+        """Cancelar un modelo aborta las transferencias Xet del proceso entero.
+
+        Un intento ajeno que muere por ese aborto no falló: queda "sin
+        descargar" para poder reintentarse sin un error que no es suyo.
+        """
+        use_demo_cache(tmp_path, monkeypatch)
+        monkeypatch.setattr(model_ops, "_abort_epoch", model_ops._abort_epoch)
+
+        def fake_abort() -> bool:
+            model_ops._abort_epoch += 1  # lo que hace el aborto real de Xet
+            return True
+
+        def foreign_abort_download(repo, tqdm_class=None, max_workers=None):
+            # Otro modelo se cancela justo mientras este intento corre.
+            time.sleep(0.05)
+            fake_abort()
+            raise RuntimeError("descarga abortada por la sesión Xet")
+
+        monkeypatch.setattr(model_ops, "snapshot_download", foreign_abort_download)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
+        state = ops.snapshot("demo")
+
+        assert state.state == model_ops.IDLE
+        assert state.error == ""
 
     def test_rejects_mock_bridge_and_busy_models(self, tmp_path, monkeypatch):
         use_demo_cache(tmp_path, monkeypatch)

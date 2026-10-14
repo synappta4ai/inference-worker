@@ -4,8 +4,18 @@ El panel "Tu GPU" administra desde acá la caché de Hugging Face
 (HF_HUB_CACHE), la misma que usan `snapshot_download` y `from_pretrained`:
 
   • start_download(key) → descarga en un hilo daemon, con progreso y
-    cancelación (la barra de progreso de huggingface aborta la descarga).
-  • cancel(key)         → pide abortar y espera hasta 2 s a que el hilo pare.
+    cancelación: la barra de progreso de huggingface aborta los caminos HTTP
+    y `cancel()` aborta además las transferencias Xet en vuelo (los bytes de
+    esas los mueve Rust, así que la barra nunca ve la señal de parada).
+  • cancel(key)         → pide abortar y espera hasta 2 s a que el hilo pare;
+    descarta los bytes a medio bajar de ese intento.
+
+El tamaño y el porcentaje que ve el panel salen de lo que el modelo tiene
+COMPLETO en disco (pesos utilizables) más, sólo mientras hay una descarga
+viva, los bytes a medio bajar de ESE intento: los restos de intentos que ya
+no corren se excluyen y se borran (`purge_partial_downloads`): un modelo
+cancelado no suma a su tamaño ni a su porcentaje los bytes que quedaron a
+medio bajar.
   • delete(key)         → borra la caché del repo y libera el disco.
   • snapshot(key)       → estado por clave: idle | downloading | ready |
     failed. `deleted` sólo aparece como respuesta inmediata de un borrado.
@@ -41,6 +51,7 @@ FAILED = "failed"
 DELETED = "deleted"
 
 # Espera máxima de `cancel()` a que el hilo de descarga confirme la parada.
+# Corta a propósito: el back espera esta RPC con timeout de 6 s.
 _CANCEL_GRACE_S = 2.0
 
 # Hilos concurrentes de `snapshot_download` (1 hilo = 1 fichero a la vez).
@@ -171,7 +182,10 @@ class RepoStats:
     """Foto de la caché local de un repo."""
 
     on_disk: int = 0               # bytes ocupados en disco (directorio entero)
-    downloaded: int = 0            # bytes de pesos requeridos ya en disco
+    committed: int = 0             # pesos requeridos COMPLETOS en disco
+    partial_bytes: int = 0         # de esos pesos, bytes a medio bajar
+    partial_disk_bytes: int = 0    # TODOS los bytes a medio bajar del repo
+    downloaded: int = 0            # committed + partial_bytes (intento vivo)
     total: int = 0                 # bytes de pesos requeridos
     complete: bool = False
     has_files: bool = False        # hay algún snapshot en disco
@@ -269,6 +283,7 @@ def inspect_repo(repo: str | None) -> RepoStats:
             except OSError:
                 continue
             partial[f.split(".", 1)[0]] = size
+            stats.partial_disk_bytes += size
             stats.partial = True
 
     if required:
@@ -276,19 +291,23 @@ def inspect_repo(repo: str | None) -> RepoStats:
         missing = False
         for name, meta in required.items():
             if name in present:
-                stats.downloaded += present[name]
+                stats.committed += present[name]
                 continue
             # ¿Está bajándose todavía (blob a medio terminar)?
             blob = str(meta.get("blob_id") or "")
             if blob in partial:
-                stats.downloaded += partial[blob]
+                stats.partial_bytes += partial[blob]
             else:
                 missing = True
+        stats.downloaded = stats.committed + stats.partial_bytes
         stats.complete = stats.has_files and not missing and not stats.partial
     else:
         # Sin árbol (caché de versiones viejas): heurística — hay snapshot,
-        # no hay .incomplete y hay algún peso. El total se desconoce.
-        stats.downloaded = stats.on_disk
+        # no hay .incomplete y hay algún peso. El total se desconoce. Los bytes
+        # a medio bajar quedan fuera del "descargado": son restos.
+        stats.committed = max(0, stats.on_disk - stats.partial_disk_bytes)
+        stats.partial_bytes = stats.partial_disk_bytes
+        stats.downloaded = stats.committed + stats.partial_bytes
         stats.complete = (
             stats.has_files
             and not stats.partial
@@ -310,6 +329,73 @@ def _dir_size(path: str) -> int:
             except OSError:
                 continue
     return total
+
+
+# Contador de abortos de transferencias: `cancel()` corta las transferencias
+# Xet de TODO el proceso (es el mismo mecanismo que usa Ctrl-C; hf_xet no
+# ofrece aborto por descarga), así que un intento que muere justo después de
+# un aborto ajeno sabe —comparando este contador— que no falló él.
+_abort_lock = threading.Lock()
+_abort_epoch = 0
+
+
+def _abort_inflight_transfers() -> bool:
+    """Corta las transferencias Xet en vuelo (lo que hace un Ctrl-C).
+
+    La cancelación por la barra de tqdm sólo llega donde hay updates de bytes;
+    en el camino Xet los mueve Rust y el hilo se queda bloqueado en
+    `wait_to_finish`, así que sin esto la descarga seguía bajando después de
+    apretar Cancelar. Devuelve true si pudo pedir el aborto.
+    """
+    global _abort_epoch
+    try:
+        # huggingface_hub lo expone para su propio `except KeyboardInterrupt`:
+        # vive en un módulo privado porque es del motor Xet, no de la API.
+        from huggingface_hub.utils._xet import abort_xet_session  # type: ignore
+    except Exception:  # noqa: BLE001 — sin hf_xet (o módulo movido) no hay nada
+        return False
+    with _abort_lock:
+        _abort_epoch += 1
+    try:
+        abort_xet_session()
+    except Exception as exc:  # noqa: BLE001 — sin sesión viva no hay nada que abortar
+        logger.debug("[model_ops] no pude abortar la sesión Xet: %s", exc)
+        return False
+    return True
+
+
+def purge_partial_downloads(repo: str | None) -> int:
+    """Borra los `.incomplete` que dejó un intento que ya no corre (bytes).
+
+    huggingface_hub 1.33 baja cada archivo a un temporal único
+    (`<etag>.<uuid>.incomplete`) que borra él mismo al fallar, así que lo que
+    queda acá es de intentos que murieron sin poder limpiar (corte de luz, kill
+    del proceso). Como el nombre es único por intento NO se reanudan: sólo
+    ocupan disco y hacían que el panel contara tamaño y porcentaje de restos
+    viejos. Los archivos completos (blobs + snapshots) no se tocan.
+    """
+    d = repo_cache_dir(repo)
+    if d is None:
+        return 0
+    blobs = os.path.join(d, "blobs")
+    if not os.path.isdir(blobs):
+        return 0
+    freed = 0
+    for name in os.listdir(blobs):
+        if not name.endswith(".incomplete"):
+            continue
+        path = os.path.join(blobs, name)
+        try:
+            freed += os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            # En uso por otro proceso (Windows no deja borrar un archivo
+            # abierto) o ya se fue: es best-effort, no frenamos la descarga.
+            continue
+    if freed:
+        logger.info("[model_ops] %s: %d bytes de descargas sin terminar "
+                    "descartados", repo, freed)
+    return freed
 
 
 def _bars_disabled() -> bool:
@@ -393,9 +479,14 @@ class ModelOps:
         model = ModelState(key=key)
         model.downloaded = stats.complete
         model.downloading = running
-        model.bytes_downloaded = stats.downloaded
+        # Tamaño y porcentaje cuentan lo que este modelo tiene de verdad: los
+        # pesos completos y, sólo mientras la descarga está viva, los bytes a
+        # medio bajar de ESE intento. Los restos de intentos que ya no corren
+        # (o que murieron) se excluyen y se borran al parar.
+        live = stats.downloaded if running else stats.committed
+        model.bytes_downloaded = live
         model.total_bytes = total or stats.total
-        model.size_bytes = stats.on_disk
+        model.size_bytes = live
 
         if running:
             model.state = DOWNLOADING
@@ -411,7 +502,7 @@ class ModelOps:
             model.progress = 100.0
         elif model.total_bytes > 0:
             model.progress = min(
-                99.9, 100.0 * stats.downloaded / model.total_bytes
+                99.9, 100.0 * model.bytes_downloaded / model.total_bytes
             )
         return model
 
@@ -445,6 +536,9 @@ class ModelOps:
                 raise ValueError(
                     "ya hay una descarga en curso para este modelo"
                 )
+            # Arrancar limpio: los restos de un intento muerto no se reanudan y
+            # sólo inflarían el tamaño/porcentaje que reporta el panel.
+            purge_partial_downloads(spec.repo)
             op.state = DOWNLOADING
             op.error = ""
             op.cancel = threading.Event()
@@ -475,10 +569,18 @@ class ModelOps:
             state.error = "no hay ninguna descarga en curso para este modelo"
             return state
 
-        # La parada se dispara en el siguiente update de la barra: casi
-        # siempre es instantánea; si tarda, devolvemos el estado actual.
+        # Doble vía: la barra de progreso aborta los caminos que pasan por ella
+        # (HTTP) y el aborto de la sesión Xet corta lo que mueve Rust.
+        aborted = _abort_inflight_transfers()
         if thread is not None:
             thread.join(_CANCEL_GRACE_S)
+        with self._lock:
+            still_running = self._running(op)
+        if still_running:
+            logger.warning("[model_ops] %s sigue transfiriendo "
+                           "%s después de cancelar; el panel lo muestra "
+                           "hasta que pare", key,
+                           "tras el aborto de Xet" if aborted else "(sin Xet)")
         return self.snapshot(key)
 
     def _download(self, key: str, spec: ModelSpec, op: _Op) -> None:
@@ -491,6 +593,7 @@ class ModelOps:
         # conoce al terminar.
         with self._lock:
             op.total_bytes = inspect_repo(spec.repo).total
+            epoch = _abort_epoch
 
         try:
             snapshot_download(
@@ -499,17 +602,53 @@ class ModelOps:
                 max_workers=_DOWNLOAD_WORKERS,
             )
         except DownloadCancelled:
-            finish(IDLE)
-            logger.info("[model_ops] descarga cancelada: %s", key)
+            self._stopped(key, spec, op, epoch, cancelled=True)
             return
-        except Exception as exc:  # un fallo de red no debe tumbar el worker
-            finish(FAILED, f"{type(exc).__name__}: {exc}")
-            logger.warning("[model_ops] %s no se pudo descargar: %s", key, exc)
+        except BaseException as exc:  # noqa: BLE001 — ver _stopped()
+            self._stopped(key, spec, op, epoch, exc=exc)
             return
 
         finish(IDLE)
+        # Un intento muerto pudo dejar `.incomplete` atrás: si el modelo quedó
+        # descargado, esos restos no tienen por qué ocupar disco ni contarse.
+        purge_partial_downloads(spec.repo)
         stats = inspect_repo(spec.repo)
         logger.info("[model_ops] %s descargado (%d bytes)", key, stats.on_disk)
+
+    def _stopped(self, key: str, spec: ModelSpec, op: _Op, epoch: int,
+                 exc: BaseException | None = None,
+                 cancelled: bool = False) -> None:
+        """Cierra un intento que terminó antes de tiempo y limpia sus restos.
+
+        Atrapa `BaseException` (y no `Exception`) porque el aborto de las
+        transferencias Xet —lo que dispara `cancel()`— no viaja como error
+        normal: puede llegar como `KeyboardInterrupt`, el mismo camino que usa
+        Ctrl-C en huggingface_hub.
+        """
+        with self._lock:
+            cancelled = cancelled or op.cancel.is_set()
+            # `cancel()` aborta las transferencias Xet de TODO el proceso: un
+            # intento ajeno que muere por ese aborto no falló, así que vuelve a
+            # "sin descargar" (reintentable) en vez de quedar en error.
+            interrupted = not cancelled and _abort_epoch != epoch
+            op.state = IDLE if (cancelled or interrupted) else FAILED
+            op.error = "" if (cancelled or interrupted) else (
+                f"{type(exc).__name__}: {exc}")
+
+        freed = purge_partial_downloads(spec.repo)
+        if cancelled:
+            logger.info("[model_ops] descarga cancelada: %s (%d bytes a medio "
+                        "bajar descartados)", key, freed)
+        elif interrupted:
+            logger.warning("[model_ops] %s interrumpido por la cancelación de "
+                           "otro modelo (%s); queda listo para reintentar",
+                           key, exc)
+        else:
+            # Con traza: el estado sólo guarda type+message, y un mensaje
+            # suelto ("[Errno 13] Permission denied") no dice si el fallo
+            # fue al escribir la caché, al mover el archivo o al bajarlo.
+            logger.warning("[model_ops] %s no se pudo descargar: %s", key, exc,
+                           exc_info=True)
 
     # ── borrado ────────────────────────────────────────────────────────
     def delete_all(self) -> tuple[list[str], dict[str, str], int]:

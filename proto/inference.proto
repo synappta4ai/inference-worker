@@ -52,7 +52,7 @@ message ModelInfo {
   bool downloaded = 12;   // pesos completos en disco (no se vuelve a bajar)
   bool downloading = 13;  // descarga en curso ahora mismo
   float download_percent = 14; // 0..100 mientras descarga
-  int64 size_bytes = 15;  // bytes ocupados en disco (0 si no está)
+  int64 size_bytes = 15;  // pesos completos en disco (0 si no hay ninguno)
   string download_error = 16; // último error de descarga/borrado
 }
 
