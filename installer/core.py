@@ -21,6 +21,8 @@ Certificados: los .exe embebidos (PyInstaller y el Python embeddable) no
 traen CA store, así que TODA invocación lleva SSL_CERT_FILE/PIP_CERT al
 cacert.pem que empaqueta el instalador — pip, get-pip, el bridge (HTTPS
 contra el back) y las descargas de python.org comparten la misma raíz.
+La ruta sale de `cacert_path()`, que sólo devuelve un ARCHIVO `.pem` (una
+carpeta no sirve como CA: httpx/ssl la rechazan con "Permission denied").
 """
 
 from __future__ import annotations
@@ -103,15 +105,41 @@ def build_payload(repo_root: Path, dest: Path) -> int:
     return count
 
 
+def payload_zip(path: Optional[Path]) -> Optional[Path]:
+    """El `.zip` real detrás de una ruta, o None si no hay ninguno.
+
+    Mismo caso que `pem_file`: PyInstaller guarda `--add-data <zip>;_payload.zip`
+    como una CARPETA llamada `_payload.zip` con el zip adentro. Ahí
+    `Path.exists()` daba true apuntando a un DIRECTORIO, y `extract_payload`
+    moría con `IsADirectoryError`; el fallback lo tapaba bajando el zip de
+    `PAYLOAD_URL`, así que el payload embebido no se usaba nunca y sin red el
+    Paso 1 fallaba. Por eso sólo se acepta un archivo (o el zip dentro de la
+    carpeta, que es el mismo payload).
+    """
+    if path is None:
+        return None
+    if path.is_file():
+        return path
+    if path.is_dir():
+        for candidate in sorted(path.glob("*.zip")):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def payload_source(explicit: Optional[Path] = None) -> Path:
     """Zip del payload: --payload, el embebido en el .exe, o el del repo."""
     if explicit is not None:
         return explicit
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        bundled = Path(meipass) / "_payload.zip"
-        if bundled.exists():
-            return bundled
+        bundled = payload_zip(Path(meipass) / "_payload.zip")
+        if bundled is None:
+            # Congelado y sin payload: armar "desde el repo" acá zippearía el
+            # bundle entero (DLLs incluidos) como si fuera código del worker.
+            # OSError para que el instalador caiga al zip publicado.
+            raise OSError(f"el paquete no trae su payload embebido en {meipass}")
+        return bundled
     # desde el repo: lo generamos al vuelo en un tmp
     import tempfile
     tmp = Path(tempfile.gettempdir()) / "synapta-worker-payload.zip"
@@ -159,18 +187,39 @@ def worker_dir(workdir: Path) -> Path:
     return workdir / "worker"
 
 
+def pem_file(path: Optional[Path]) -> Optional[Path]:
+    """El `.pem` real detrás de una ruta, o None si no hay ninguno.
+
+    PyInstaller puede extraer `--add-data <cacert.pem>;_cacert.pem` como una
+    CARPETA llamada `_cacert.pem` con el `.pem` adentro. Aceptar eso como CA
+    (basta `Path.exists()`) rompe en dos lugares: `ssl.create_default_context
+    (cafile=<carpeta>)` falla con "PermissionError: [Errno 13] Permission
+    denied", y el worker hereda ese SSL_CERT_FILE y mata TODAS las descargas
+    de modelos (httpx abre el CA a mano). Por eso sólo se acepta un archivo.
+    """
+    if path is None:
+        return None
+    if path.is_file():
+        return path
+    if path.is_dir():
+        for candidate in sorted(path.glob("*.pem")):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def cacert_path() -> Optional[Path]:
-    """cacert.pem: embebido en el .exe, o el de certifi si está instalado."""
+    """cacert.pem: el archivo embebido en el .exe, o el de certifi."""
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        bundled = Path(meipass) / "_cacert.pem"
-        if bundled.exists():
+        bundled = pem_file(Path(meipass) / "_cacert.pem")
+        if bundled is not None:
             return bundled
     try:
         import certifi
-        return Path(certifi.where())
     except Exception:  # noqa: BLE001 — sin certifi seguimos sin TLS verificado
         return None
+    return pem_file(Path(certifi.where()))
 
 
 def net_env(extra: Optional[dict] = None) -> dict:

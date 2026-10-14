@@ -8,11 +8,13 @@ destruida al terminar — no necesita pantalla interactiva).
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import queue as queue_mod
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -148,6 +150,111 @@ def test_python_and_worker_paths(tmp_path):
     assert core.python_path(tmp_path).name in ("python.exe", "python")
     assert core.python_path(tmp_path).parent.name == "python"
     assert core.worker_dir(tmp_path) == tmp_path / "worker"
+
+
+# ── CA store (SSL_CERT_FILE / PIP_CERT) ──────────────────────────
+def test_cacert_path_accepts_bundled_pem_file(tmp_path, monkeypatch):
+    bundled = tmp_path / "_cacert.pem"
+    bundled.write_text("PEM", encoding="utf-8")
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert core.cacert_path() == bundled
+
+
+def test_cacert_path_unwraps_bundled_directory(tmp_path, monkeypatch):
+    """Regresión: PyInstaller extrajo `_cacert.pem` como CARPETA.
+
+    Devolverla como CA rompe `ssl.create_default_context(cafile=...)` con
+    "PermissionError: [Errno 13] Permission denied", y el worker heredaba ese
+    SSL_CERT_FILE: ninguna descarga de pesos llegaba a arrancar.
+    """
+    folder = tmp_path / "_cacert.pem"
+    folder.mkdir()
+    (folder / "cacert.pem").write_text("PEM", encoding="utf-8")
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    resolved = core.cacert_path()
+    assert resolved is not None and resolved.is_file()
+    assert resolved.name == "cacert.pem"
+
+
+def test_net_env_never_points_ca_at_a_directory(tmp_path, monkeypatch):
+    """El env que hereda el worker (y pip) debe apuntar a un archivo."""
+    folder = tmp_path / "_cacert.pem"
+    folder.mkdir()
+    (folder / "cacert.pem").write_text("PEM", encoding="utf-8")
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    env = core.net_env()
+    for var in ("SSL_CERT_FILE", "PIP_CERT"):
+        value = env.get(var)
+        if value is not None:
+            assert Path(value).is_file(), f"{var} → {value} no es un archivo"
+
+
+# ── payload embebido en el .exe ─────────────────────────────────
+def test_payload_source_unwraps_bundled_directory(tmp_path, monkeypatch):
+    """Regresión: PyInstaller guardó `_payload.zip` como CARPETA.
+
+    Devolverla tal cual hacía que `ZipFile(<carpeta>)` reventara con
+    IsADirectoryError y el instalador bajara el payload de la red siempre
+    (y sin internet no instalaba), aunque el zip embebido estaba al lado.
+    """
+    folder = tmp_path / "_payload.zip"
+    folder.mkdir()
+    inner = folder / "_payload.zip"
+    inner.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert core.payload_source() == inner
+
+
+def test_payload_source_accepts_flat_zip(tmp_path, monkeypatch):
+    bundled = tmp_path / "_payload.zip"
+    bundled.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert core.payload_source() == bundled
+
+
+def test_payload_source_frozen_without_bundle_never_zips_the_bundle(tmp_path, monkeypatch):
+    """Sin payload embebido el instalador debe caer al zip publicado (OSError).
+
+    Armar "desde el repo" congelado tomaría el propio _MEIPASS (DLLs y todo)
+    como payload del worker.
+    """
+    (tmp_path / "_payload.zip").mkdir()
+    monkeypatch.setattr(core.sys, "_MEIPASS", str(tmp_path), raising=False)
+    with pytest.raises(OSError, match="payload embebido"):
+        core.payload_source()
+
+
+def test_payload_source_falls_back_to_repo(tmp_path, monkeypatch):
+    """Sin embebido (corriendo desde el repo) arma el zip al vuelo."""
+    repo = tmp_path / "repo"
+    _make_repo(repo, {"run.py": "print('ok')\n"})
+    monkeypatch.setattr(core, "__file__", str(repo / "installer" / "core.py"))
+    monkeypatch.delattr(core.sys, "_MEIPASS", raising=False)
+    with zipfile.ZipFile(core.payload_source()) as zf:
+        assert "run.py" in zf.namelist()
+
+
+def test_bundled_payload_is_a_real_zip_after_build():
+    """El .exe de dist/ existe: su payload embebido se extrae sin tocar la red.
+
+    Es el caso exacto que rompía: si el layout del bundle cambia (otro
+    PyInstaller, otro `--add-data`), este test lo caza antes de publicarlo.
+    """
+    exe = Path(__file__).resolve().parent.parent / "dist" / (
+        "SynaptaWorker-Setup.exe" if os.name == "nt" else "SynaptaWorker-Setup")
+    if not exe.is_file():
+        pytest.skip("no hay dist/ construido en esta máquina")
+    from PyInstaller.archive.readers import CArchiveReader
+
+    archive = CArchiveReader(str(exe))
+    entries = archive.toc
+    name = next(n for n in entries if n.rstrip("\\").endswith("_payload.zip"))
+    assert entries[name][-1] == "b", f"{name} no es un archivo embebido"
+    blob = archive.extract(name)
+    blob = blob if isinstance(blob, bytes) else blob.read()
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert {"run.py", "pair.py", "requirements.txt"} <= set(zf.namelist())
+        assert "_normalize_ca_env" in zf.read("run.py").decode("utf-8")
 
 
 # ── validación de emparejamiento (sin red: falla antes) ──────────

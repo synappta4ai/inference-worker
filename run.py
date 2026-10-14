@@ -25,6 +25,8 @@ import os
 import signal
 import sys
 import threading
+from pathlib import Path
+from typing import Optional
 
 # Consolas Windows (cp1252) revientan con los emojis de los logs.
 if hasattr(sys.stdout, "reconfigure"):
@@ -46,6 +48,67 @@ def _load_dotenv() -> None:
         pass
 
 
+# Variables que apuntan al CA store para las librerías que las leen solas.
+_CA_ENV_VARS = ("SSL_CERT_FILE", "PIP_CERT", "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE")
+
+
+def _own_cacert() -> Optional[Path]:
+    """cacert.pem del python del worker (ruta estable, dentro de la app)."""
+    try:
+        import certifi
+    except Exception:  # noqa: BLE001 — sin certifi se cae a quitar la var
+        return None
+    path = Path(certifi.where())
+    return path if path.is_file() else None
+
+
+def _inherited_ca_is_usable(value: str) -> bool:
+    """true si el CA heredado sirve de verdad para TLS.
+
+    Tiene que ser un ARCHIVO legible y fuera de la carpeta temporal del
+    instalador: PyInstaller extrae `_MEIxxxx` al arrancar el .exe y la borra
+    al cerrarse, así que un SSL_CERT_FILE que apunte ahí (o a una carpeta
+    con ese nombre) deja TODA descarga de modelos muerta con
+    "PermissionError: [Errno 13] Permission denied" — sin traza en el panel,
+    que sólo ve "No disponible" para siempre.
+    """
+    if not value:
+        return False
+    path = Path(value)
+    if not path.is_file() or not os.access(path, os.R_OK):
+        return False
+    try:
+        parts = path.resolve().parts
+    except OSError:
+        return False
+    return not any(part.upper().startswith("_MEI") for part in parts)
+
+
+def _normalize_ca_env() -> None:
+    """Sanea el CA heredado del proceso que arrancó al worker.
+
+    httpx (huggingface_hub) arma su contexto con
+    `ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])`: con una
+    carpeta o una ruta ya inexistente falla y la descarga de pesos nunca
+    empieza. Se reemplaza por el certifi del propio worker (que sí es
+    estable) y, si no está, se quita la variable — mejor contexto del
+    sistema que una ruta rota.
+    """
+    own = _own_cacert()
+    for var in _CA_ENV_VARS:
+        value = os.environ.get(var)
+        if not value or _inherited_ca_is_usable(value):
+            continue
+        if own is not None:
+            os.environ[var] = str(own)
+        else:
+            os.environ.pop(var, None)
+        logger.info("[run] %s heredado inválido (%s) → usando el CA del "
+                    "worker: %s", var, value,
+                    own if own is not None else "el del sistema")
+
+
 _load_dotenv()
 
 logging.basicConfig(
@@ -53,6 +116,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("run")
+
+# Después del logging: el saneo avisa por log cuándo reemplaza una CA heredada.
+_normalize_ca_env()
 
 
 def _start_bridge_agent() -> "threading.Thread | None":
