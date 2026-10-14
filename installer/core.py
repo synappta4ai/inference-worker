@@ -518,7 +518,7 @@ def diagnose_back(back: str, timeout: float = 5.0) -> list:
 
     url = back.rstrip("/") + "/healthz"
     try:
-        ctx = ssl.create_default_context(cafile=str(cacert_path() or "") or None)
+        ctx = _diagnostic_ssl_context()
         req = urllib.request.Request(url, headers={"User-Agent": "SynaptaWorker-Setup"})
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             code = getattr(resp, "status", 200)
@@ -533,6 +533,23 @@ def diagnose_back(back: str, timeout: float = 5.0) -> list:
         add("HTTP", False,
             f"{url} → {code}: responde pero no es el back de Synapta")
     return steps
+
+
+def _diagnostic_ssl_context() -> "ssl.SSLContext":
+    """TLS solo para el paso HTTP del diagnóstico.
+
+    Prefiere el CA embebido, pero si el .exe no puede leerlo (antivirus o
+    ACLs del dir temporal → Permission denied), cae al contexto del sistema:
+    lo que se quiere probar es la red, no el bundle. Sin este fallback el
+    paso HTTP daba un falso ✕ con URL/DNS/TCP en verde.
+    """
+    ca = cacert_path()
+    if ca is not None:
+        try:
+            return ssl.create_default_context(cafile=str(ca))
+        except OSError:
+            pass
+    return ssl.create_default_context()
 
 
 # ── proceso del worker ────────────────────────────────────────────
