@@ -392,6 +392,51 @@ def test_extract_fallback_downloads_when_blocked(tmp_path, monkeypatch):
     assert (target / "run.py").read_text(encoding="utf-8") == "print('ok')\n"
 
 
+def test_ensure_python_retries_av_lock(tmp_path, monkeypatch):
+    """El zip del embeddable también lo traba el AV: reintenta y sale."""
+    import io
+    blob = io.BytesIO()
+    with zipfile.ZipFile(blob, "w") as zf:
+        zf.writestr("python.exe", "fake")
+        zf.writestr("python312._pth", "python312.zip\n.\n#import site\n")
+    def fake_download(url, dest, **kwargs):
+        dest.write_bytes(blob.getvalue())
+        return dest
+
+    monkeypatch.setattr(core, "download", fake_download)
+    real_zipfile = zipfile.ZipFile
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "Permission denied", str(args[0]))
+        return real_zipfile(*args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", flaky)
+    monkeypatch.setattr(core.time, "sleep", lambda *a: None)
+    py = core.ensure_python(tmp_path)
+    assert py.exists()
+    assert calls["n"] >= 3
+
+
+def test_install_stops_worker_first(tmp_path, monkeypatch):
+    """Reinstalar con el worker corriendo no debe chocar por DLLs bloqueadas."""
+    order: list = []
+    monkeypatch.setattr(core, "stop",
+                        lambda wd=None: order.append("stop") or None)
+    monkeypatch.setattr(core, "_extract_with_fallback",
+                        lambda *a, **k: order.append("extract"))
+    monkeypatch.setattr(core, "ensure_python",
+                        lambda wd: order.append("python"))
+    monkeypatch.setattr(core, "ensure_pip", lambda *a: None)
+    monkeypatch.setattr(core, "install_deps", lambda *a: None)
+    monkeypatch.setattr(core, "run_doctor", lambda *a: None)
+    monkeypatch.setattr(core, "worker_status", lambda wd=None: {})
+    core.install(tmp_path)
+    assert order[:3] == ["stop", "extract", "python"]
+
+
 # ── diagnose_back (servidor HTTP local, sin internet) ────────────
 def _serve_health(tmp_path):
     import functools

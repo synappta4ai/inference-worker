@@ -188,16 +188,50 @@ def net_env(extra: Optional[dict] = None) -> dict:
 
 
 # ── utilidades ────────────────────────────────────────────────────
-def download(url: str, dest: Path, timeout: float = 60.0) -> Path:
+def download(url: str, dest: Path, timeout: float = 60.0,
+             retries: int = 3) -> Path:
+    """Baja un archivo con reintentos (el antivirus también traba acá)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    ctx = ssl.create_default_context(cafile=str(cacert_path() or "") or None)
+    ctx = _tls_context()
     logger.info("bajando %s …", url)
-    req = urllib.request.Request(url, headers={"User-Agent": "SynaptaWorker-Setup"})
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, \
-            open(dest, "wb") as out:
-        shutil.copyfileobj(resp, out)
-    logger.info("  → %s (%d KB)", dest.name, dest.stat().st_size // 1024)
-    return dest
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "SynaptaWorker-Setup"})
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=ctx) as resp, \
+                    open(dest, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            logger.info("  → %s (%d KB)", dest.name,
+                        dest.stat().st_size // 1024)
+            return dest
+        except Exception as exc:  # noqa: BLE001 — todo fallo baja al reintento
+            last = exc
+            logger.warning("descarga interrumpida (%s), reintento %d/%d…",
+                           exc, attempt + 1, retries)
+            time.sleep(2)
+    raise RuntimeError(f"no pude descargar {url} ({last}): revisá tu conexión "
+                       "y pausá el antivirus un momento") from None
+
+
+def _unzip_retry(zip_path: Path, target: Path, what: str,
+                 retries: int = 6) -> None:
+    """Extrae con reintentos: el AV traba los zips recién escritos."""
+    for attempt in range(retries):
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(target)
+            return
+        except PermissionError:
+            if attempt + 1 >= retries:
+                raise RuntimeError(
+                    f"permiso denegado con {what} ({zip_path}): el antivirus "
+                    "o un worker viejo en ejecución lo está bloqueando. "
+                    "Pausá la protección en tiempo real y reintentá") from None
+            logger.warning("%s bloqueado (antivirus?), reintento %d/%d…",
+                           what, attempt + 1, retries)
+            time.sleep(3)
 
 
 def run_capture(cmd: list, cwd: Optional[Path] = None, env: Optional[dict] = None,
@@ -284,8 +318,7 @@ def ensure_python(workdir: Path) -> Path:
         logger.info("preparando Python %s (embeddable) …", EMBED_VERSION)
         zip_path = download(EMBED_URL, workdir / "_python.zip")
         pydir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(pydir)
+        _unzip_retry(zip_path, pydir, "Python embeddable")
         zip_path.unlink(missing_ok=True)
 
     # El parche corre SIEMPRE: mantiene el ._pth sincronizado aunque el
@@ -405,6 +438,14 @@ def install(workdir: Optional[Path] = None,
     workdir = (workdir or default_dir()).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     logger.info("instalando en %s", workdir)
+
+    # Un worker viejo corriendo desde esta carpeta bloquea sus DLLs y la
+    # reinstalación muere con Permission denied: detenerlo primero libera
+    # los archivos. Nunca debe frenar la instalación si falla.
+    try:
+        stop(workdir)
+    except Exception:  # noqa: BLE001 — informativo, no fatal
+        pass
 
     _extract_with_fallback(payload_source(payload), worker_dir(workdir),
                            payload_url=payload_url, workdir=workdir)
