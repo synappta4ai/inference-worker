@@ -115,6 +115,11 @@ def _load_image_pipeline(repo: str, use_gpu: bool, dtype_str: str):
         cls = StableDiffusionPipeline
 
     logger.info("[Factory] Cargando imagen %s (gpu=%s, %s)...", repo, use_gpu, dtype_str)
+    # Sin pesos en disco no se genera: la descarga se pide desde /gpu
+    # (modo personal) en vez de saturar la máquina por sorpresa.
+    from model_ops import require_weights  # tardío: evita ciclo de imports
+
+    require_weights(repo)
     pipe = cls.from_pretrained(repo, torch_dtype=dtype)
     if use_gpu:
         pipe.enable_model_cpu_offload()
@@ -172,6 +177,9 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
                 "Wan en GPU requiere 'bitsandbytes' (cuantiza el text encoder "
                 "de 21 GB fp32 a ~2.5 GB); instalalo y reintenta"
             )
+    from model_ops import require_weights  # tardío: evita ciclo de imports
+
+    require_weights(repo)
     pipe = cls.from_pretrained(repo, **kwargs)
     # Los videos son pesados: offload siempre que exista; en CPU es lo único
     # que cabe junto con attention slicing.

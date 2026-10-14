@@ -13,6 +13,11 @@ Salida:
   ../front-synapta/src/assets/worker/SynaptaWorker-Setup.exe   (--into-front)
   ../front-synapta/src/assets/worker/synapta-worker.zip        (--into-front)
 
+Antivirus (falsos positivos de Windows Defender): el .exe sale con --noupx
+porque empaquetar/comprimir el bootloader es una señal heurística típica.
+Al final se imprime el SHA-256 para verificar el artefacto y reportarlo en
+https://www.microsoft.com/en-us/wdsi/filesubmission si lo marcan.
+
 El zip que se regenera acá es la descarga para máquinas sin Windows
 (mismo contenido que instala el .exe), así ambos siempre coinciden.
 """
@@ -52,6 +57,9 @@ def build(into_front: bool = False) -> Path:
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--onefile", "--windowed",
+        # Sin UPX: comprimir el bootloader dispara heurísticas de antivirus
+        # (falsos positivos) sin aportar casi nada al tamaño final.
+        "--noupx",
         "--name", "SynaptaWorker-Setup",
         "--paths", str(WORKER_ROOT),
         "--add-data", f"{payload}{sep}_payload.zip",
@@ -81,6 +89,13 @@ def build(into_front: bool = False) -> Path:
               f" ({(FRONT_ASSETS / 'SynaptaWorker-Setup.exe').stat().st_size // 1024} KB)")
         print(f"→ zip no-Windows regenerado: {zip_dest.name}"
               f" ({zip_dest.stat().st_size // 1024} KB)")
+
+    import hashlib
+
+    digest = hashlib.sha256(exe.read_bytes()).hexdigest()
+    print(f"SHA-256: {digest}")
+    print("Si Defender lo marca: reportar ese hash en "
+          "https://www.microsoft.com/en-us/wdsi/filesubmission")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"OK: {exe} ({exe.stat().st_size // 1024 // 1024} MB)")

@@ -226,6 +226,125 @@ def test_cli_unknown_command(capsys):
     assert exc.value.code == 2
 
 
+# ── clasificación de errores de pairing ─────────────────────────
+def test_classify_expired_code():
+    msg = core.classify_pair_failure(1, ["❌ No pude emparejar: POST /register → HTTP 401: expired"])
+    assert "venció" in msg and "nuevo" in msg
+
+
+def test_classify_connection_refused():
+    msg = core.classify_pair_failure(
+        1, ["❌ No pude emparejar: POST /register sin conexión: [Errno 111] Connection refused"])
+    assert "no llegué al back" in msg
+
+
+def test_classify_tls_failure():
+    msg = core.classify_pair_failure(1, ["❌ No pude emparejar: SSL: CERTIFICATE_VERIFY_FAILED"])
+    assert "TLS" in msg
+
+
+def test_classify_404_wrong_url():
+    msg = core.classify_pair_failure(1, ["POST /register → HTTP 404: not found"])
+    assert "/api/v1" in msg
+
+
+def test_classify_unknown_keeps_last_line():
+    msg = core.classify_pair_failure(3, ["Conectando con http://x…", "algo raro pasó"])
+    assert "algo raro pasó" in msg
+
+
+def test_classify_empty_output_never_generic_only():
+    msg = core.classify_pair_failure(1, [])
+    assert "Diagnosticar" in msg
+
+
+def test_pair_surfaces_bridge_error(tmp_path, monkeypatch):
+    py = core.python_path(tmp_path)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("x", encoding="utf-8")
+    (core.worker_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        core, "run_capture",
+        lambda *a, **k: (1, ["❌ No pude emparejar: HTTP 401: code expired"]))
+    with pytest.raises(RuntimeError, match="venció"):
+        core.pair(tmp_path, back="http://localhost:9999", code="123456")
+
+
+def test_pair_ok_swallows_nothing(tmp_path, monkeypatch):
+    py = core.python_path(tmp_path)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text("x", encoding="utf-8")
+    (core.worker_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "run_capture", lambda *a, **k: (0, ["ok"]))
+    core.pair(tmp_path, back="http://localhost:9999", code="123456")  # no lanza
+
+
+# ── diagnose_back (servidor HTTP local, sin internet) ────────────
+def _serve_health(tmp_path):
+    import functools
+    import http.server
+    import threading
+
+    # /healthz con 200: el back real expone ese endpoint
+    class Health(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz":
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(
+        ("127.0.0.1", 0),
+        functools.partial(Health, directory=str(tmp_path)))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_diagnose_all_green_against_local_server(tmp_path):
+    srv = _serve_health(tmp_path)
+    try:
+        steps = core.diagnose_back(f"http://127.0.0.1:{srv.server_port}")
+    finally:
+        srv.shutdown()
+    assert [s["step"] for s in steps] == ["URL", "DNS", "TCP", "HTTP"]
+    assert all(s["ok"] for s in steps)
+
+
+def test_diagnose_dead_port_fails_tcp(tmp_path):
+    steps = core.diagnose_back("http://127.0.0.1:9")  # discard: casi seguro cerrado
+    by_step = {s["step"]: s for s in steps}
+    assert by_step["URL"]["ok"] is True
+    assert by_step["DNS"]["ok"] is True
+    assert by_step["TCP"]["ok"] is False
+    assert len(steps) == 3  # sin TCP no hay HTTP
+
+
+def test_diagnose_bad_url_fails_first_step():
+    steps = core.diagnose_back("ftp://x")
+    assert steps == [{"step": "URL", "ok": False, "detail": steps[0]["detail"]}]
+    assert "http" in steps[0]["detail"]
+
+
+def test_cli_diagnose_reports_steps(tmp_path, capsys):
+    srv = _serve_health(tmp_path)
+    try:
+        rc = core.main(["--dir", str(tmp_path), "diagnose",
+                        "--back", f"http://127.0.0.1:{srv.server_port}"])
+    finally:
+        srv.shutdown()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "✓ HTTP" in out
+
+
 # ── GUI (una instancia real, sin mainloop) ────────────────────────
 def test_gui_builds_and_reports_status(tmp_path, monkeypatch):
     tk = pytest.importorskip("tkinter")

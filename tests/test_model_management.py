@@ -36,6 +36,13 @@ def use_demo_cache(tmp_path, monkeypatch):
     return cache
 
 
+def use_demo_catalog_only(monkeypatch):
+    """Reduce el catálogo visible a la demo: los tests bulk (predownload,
+    delete_all) NUNCA deben recorrer ni tocar la caché HF real del equipo
+    (50 GB: lento y destructivo)."""
+    monkeypatch.setattr(model_ops, "MODEL_CATALOG", {"demo": DEMO_SPEC})
+
+
 def write_cache_file(cache, *parts, content=b"x" * 16):
     path = cache.joinpath(*parts)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,3 +347,96 @@ class TestServerModelRPCs:
             )
 
         assert exc.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+class TestLazyDownloads:
+    """Modo personal: nada se descarga solo; el modo compartido sí."""
+
+    def test_personal_is_default(self, monkeypatch):
+        monkeypatch.delenv("BM_PROVIDER_MODE", raising=False)
+        assert model_ops.provider_mode() == model_ops.PROVIDER_MODE_PERSONAL
+        assert model_ops.provider_shared() is False
+
+    def test_shared_mode_flag(self, monkeypatch):
+        monkeypatch.setenv("BM_PROVIDER_MODE", "shared")
+        assert model_ops.provider_shared() is True
+
+    def test_require_weights_fails_fast_when_missing(self, tmp_path, monkeypatch):
+        use_demo_cache(tmp_path, monkeypatch)
+        monkeypatch.delenv("BM_PROVIDER_MODE", raising=False)
+        with pytest.raises(RuntimeError, match="Tu GPU"):
+            model_ops.require_weights("org/demo")
+
+    def test_require_weights_passes_when_complete(self, tmp_path, monkeypatch):
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        monkeypatch.delenv("BM_PROVIDER_MODE", raising=False)
+        write_repo_tree(cache, {"model.safetensors": 32})
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "model.safetensors")
+        model_ops.require_weights("org/demo")  # no debe lanzar
+
+    def test_require_weights_is_noop_in_shared_mode(self, tmp_path, monkeypatch):
+        use_demo_cache(tmp_path, monkeypatch)
+        monkeypatch.setenv("BM_PROVIDER_MODE", "shared")
+        model_ops.require_weights("org/demo")  # sin pesos, pero permitido
+
+    def test_require_weights_ignores_repoless_models(self, monkeypatch):
+        monkeypatch.delenv("BM_PROVIDER_MODE", raising=False)
+        model_ops.require_weights(None)  # mock/bridge: nada que esperar
+
+    def test_predownload_all_skips_complete(self, tmp_path, monkeypatch):
+        use_demo_catalog_only(monkeypatch)
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        write_repo_tree(cache, {"model.safetensors": 32})
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "model.safetensors")
+        launched = model_ops.predownload_all(model_ops.ModelOps())
+        assert "demo" not in launched  # ya completo: no se relanza
+
+    def test_predownload_all_launches_missing(self, tmp_path, monkeypatch):
+        use_demo_catalog_only(monkeypatch)
+        use_demo_cache(tmp_path, monkeypatch)
+        started = []
+        monkeypatch.setattr(
+            model_ops.ModelOps,
+            "start_download",
+            lambda self, key: started.append(key) or model_ops.ModelState(key=key),
+        )
+        launched = model_ops.predownload_all(model_ops.ModelOps())
+        assert "demo" in launched
+        assert "demo" in started
+
+
+class TestDeleteAll:
+    def test_delete_all_removes_every_repo(self, tmp_path, monkeypatch):
+        use_demo_catalog_only(monkeypatch)
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        write_repo_tree(cache, {"model.safetensors": 32})
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev", "model.safetensors")
+        ops = model_ops.ModelOps()
+
+        deleted, failed, freed = ops.delete_all()
+
+        assert "demo" in deleted
+        assert failed == {}
+        assert freed > 0
+        assert not (cache / "models--org--demo").exists()
+        assert ops.snapshot("demo").downloaded is False
+
+    def test_delete_all_reports_in_progress(self, tmp_path, monkeypatch):
+        use_demo_catalog_only(monkeypatch)
+        use_demo_cache(tmp_path, monkeypatch)
+        ops = model_ops.ModelOps()
+
+        def slow_download(repo, tqdm_class=None, max_workers=None):
+            time.sleep(3.0)
+            return repo
+
+        monkeypatch.setattr(model_ops, "snapshot_download", slow_download)
+        ops.start_download("demo")
+        try:
+            deleted, failed, freed = ops.delete_all()
+        finally:
+            ops.cancel("demo")
+
+        assert "demo" not in deleted
+        assert "demo" in failed  # con descarga en curso: se pide cancelar primero
+        assert freed == 0

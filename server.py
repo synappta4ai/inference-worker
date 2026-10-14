@@ -289,8 +289,19 @@ async def serve() -> None:
         from artifact_server import start_background
         start_background(int(os.environ.get("BM_ARTIFACT_PORT", "50052")))
 
+    servicer = InferenceServicer()
+    # Proveedor compartido en la nube (BM_PROVIDER_MODE=shared): pre-descarga
+    # todo el catálogo al arrancar para servir sin esperas. En modo personal
+    # (default) no se baja nada solo: cada peso sale del botón Descargar.
+    from model_ops import provider_shared, predownload_all  # tardío: igual que ModelOps
+
+    if provider_shared():
+        launched = predownload_all(servicer.ops)
+        logger.info("[Brain-Master] modo proveedor compartido: %d descarga(s) lanzada(s)",
+                    len(launched))
+
     server = aio.server()
-    inference_pb2_grpc.add_InferenceServiceServicer_to_server(InferenceServicer(), server)
+    inference_pb2_grpc.add_InferenceServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
     await server.start()
     logger.info("🧠 [Brain-Master] Worker de inferencia gRPC escuchando en :%s", port)

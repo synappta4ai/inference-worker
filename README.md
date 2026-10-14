@@ -154,6 +154,11 @@ stateless, `internal/worker`):
 - E2E cross-language (worker real + back real):
   `BM_E2E_WORKER_ADDR=127.0.0.1:50051 BM_E2E_ARTIFACT_BASE=http://127.0.0.1:50052 go test ./internal/modules/agency/video/ -run TestE2EWorker -v` (desde back-synapta).
 - Mock rápido sin GPU: `BM_ARTIFACT_PORT=50052 py -3 run_mock.py`.
+- Modo de descarga (`BM_PROVIDER_MODE`, en el worker): `personal` (default)
+  o vacío = nada se descarga solo; cada peso baja únicamente con el botón
+  Descargar de /gpu, y generar sin pesos falla con un mensaje claro en vez
+  de saturar el PC. `shared` = proveedor en la nube: al arrancar pre-descarga
+  todo el catálogo y las generaciones pueden completar pesos al vuelo.
 - Cambios de contrato: editar `proto/inference.proto` (copiado desde
   `brain-master/proto/`, la fuente histórica) y regenerar TAMBIÉN
   `back-synapta/internal/worker/proto/` (espejo del código generado).

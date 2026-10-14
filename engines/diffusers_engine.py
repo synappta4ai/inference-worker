@@ -51,6 +51,11 @@ def _load_pipeline(repo: str, use_gpu: bool):
             else StableDiffusionPipeline
         )
         logger.info("[Diffusers] Cargando %s (gpu=%s, dtype=%s)...", repo, use_gpu, dtype)
+        # En modo personal, generar con pesos ausentes NO debe disparar una
+        # descarga implícita de GB: se falla rápido y se descarga desde /gpu.
+        from model_ops import require_weights  # tardío: evita ciclo de imports
+
+        require_weights(repo)
         pipe = cls.from_pretrained(
             repo,
             torch_dtype=dtype,

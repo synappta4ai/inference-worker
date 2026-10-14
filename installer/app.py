@@ -202,6 +202,9 @@ class InstallerApp(tk.Tk):
             card, text="Conectar GPU", style="Accent.TButton",
             command=self.on_pair)
         self.pair_btn.pack(fill="x", ipady=6)
+        self.diag_btn = ttk.Button(
+            card, text="Diagnosticar conexión", command=self.on_diagnose)
+        self.diag_btn.pack(fill="x", ipady=2, pady=(4, 0))
         return frame
 
     def _screen_done(self, parent: ttk.Frame) -> ttk.Frame:
@@ -260,7 +263,7 @@ class InstallerApp(tk.Tk):
     # ── acciones ─────────────────────────────────────────────────
     def _set_busy(self, busy: bool, label: Optional[str] = None) -> None:
         self.busy = busy
-        for btn in (self.install_btn, self.pair_btn):
+        for btn in (self.install_btn, self.pair_btn, self.diag_btn):
             btn.state(["disabled"] if busy else ["!disabled"])
         if label and not busy:
             self.install_btn.configure(text=label)
@@ -338,6 +341,20 @@ class InstallerApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_diagnose(self) -> None:
+        """Pasos URL → DNS → TCP → HTTP contra el back, en texto claro."""
+        if self.busy:
+            return
+        back = self.back_var.get().strip()
+        self._set_busy(True)
+        self.pair_msg.configure(text="Diagnosticando…")
+
+        def worker() -> None:
+            steps = core.diagnose_back(back)
+            self.msgs.put(("pair_diag", steps))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_autostart(self) -> None:
         enable = bool(self.autostart_var.get())
         try:
@@ -402,6 +419,13 @@ class InstallerApp(tk.Tk):
                 elif kind == "pair_err":
                     self._set_busy(False)
                     self.pair_msg.configure(text=payload)
+                elif kind == "pair_diag":
+                    self._set_busy(False)
+                    lines = [
+                        f"{'✓' if s['ok'] else '✘'} {s['step']}: {s['detail']}"
+                        for s in payload
+                    ]
+                    self.pair_msg.configure(text="\n".join(lines))
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)

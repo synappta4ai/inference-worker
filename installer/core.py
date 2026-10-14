@@ -169,21 +169,39 @@ def download(url: str, dest: Path, timeout: float = 60.0) -> Path:
     return dest
 
 
-def run(cmd: list, cwd: Optional[Path] = None, env: Optional[dict] = None,
-        timeout: Optional[float] = None) -> int:
-    """Corre un comando logueando su salida línea a línea."""
+def run_capture(cmd: list, cwd: Optional[Path] = None, env: Optional[dict] = None,
+                timeout: Optional[float] = None) -> tuple:
+    """Corre un comando y devuelve (rc, líneas de salida).
+
+    La salida se loguea igual que en `run()`, pero además vuelve al caller
+    para clasificar el error (el pairing necesita el motivo real, no solo
+    el código de salida).
+    """
     logger.info("$ %s", " ".join(str(c) for c in cmd))
-    proc = subprocess.run(
-        [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
-        env=env or net_env(), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
+            env=env or net_env(), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("  (timeout de %.0f s)", timeout or 0)
+        return 124, [f"se agotó el tiempo de espera ({timeout:.0f} s)"]
+    lines: list = []
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
                 if line.strip():
                     logger.info("  %s", line)
-    return proc.returncode
+                    lines.append(line.strip())
+    return proc.returncode, lines
+
+
+def run(cmd: list, cwd: Optional[Path] = None, env: Optional[dict] = None,
+        timeout: Optional[float] = None) -> int:
+    """Corre un comando logueando su salida línea a línea."""
+    rc, _ = run_capture(cmd, cwd=cwd, env=env, timeout=timeout)
+    return rc
 
 
 def has_nvidia() -> bool:
@@ -321,9 +339,61 @@ def _name_flag(name: str = "") -> str:
     return name
 
 
+def _last_meaningful(lines: list) -> str:
+    """Última línea útil de un subprocess (saltea prompts y vacías)."""
+    for line in reversed(lines):
+        text = line.lstrip("❌⚠️✅· ").strip()
+        if text and not text.startswith("Conectando"):
+            return text
+    return ""
+
+
+def classify_pair_failure(rc: int, lines: list) -> str:
+    """Motivo user-facing de un pairing fallido (rc + salida de pair.py).
+
+    Nunca devuelve el genérico "revisá el código y la conexión" a secas:
+    cada causa conocida trae su pista de arreglo.
+    """
+    blob = "\n".join(lines)
+    low = blob.lower()
+    last = _last_meaningful(lines)
+
+    if rc == 2 or "debe tener 6 dígitos" in blob or "debe empezar con http" in blob:
+        return last or "parámetros inválidos (URL o código)"
+    if "401" in blob or "venc" in low or "ya fue usad" in low or "usado" in low:
+        return ("el código venció o ya se usó (vive 10 minutos): generá uno "
+                "nuevo en la app (Tu GPU → Conectar GPU)")
+    if "404" in blob:
+        return ("el back no reconoce esa ruta (404): revisá que la URL sea la "
+                "del back de Synapta, sin /api/v1 al final")
+    if any(k in low for k in ("sin conexión", "connection refused", "rechaz",
+                              "timeout", "timed out", "tiempo de espera",
+                              "nodename nor servname", "getaddrinfo",
+                              "name resolution", "no such host",
+                              "network is unreachable", "unreachable")):
+        return ("no llegué al back: revisá la URL y tu conexión a internet "
+                f"({last})" if last else
+                "no llegué al back: revisá la URL y tu conexión a internet")
+    if any(k in low for k in ("ssl", "certificate", "certificado",
+                              "tls", "handshake")):
+        return ("falló la conexión segura (TLS): revisá la fecha/hora de esta "
+                f"PC y si hay un proxy/antivirus interceptando HTTPS ({last})"
+                if last else
+                "falló la conexión segura (TLS): revisá la fecha/hora de "
+                "esta PC y si hay un proxy/antivirus interceptando HTTPS")
+    if last:
+        return f"no pude emparejar: {last}"
+    return (f"no pude emparejar (código {rc} sin detalle): probá de nuevo "
+            "y si se repite usá «Diagnosticar conexión»")
+
+
 def pair(workdir: Optional[Path] = None, back: str = DEFAULT_BACK,
          code: str = "", name: str = "") -> None:
-    """Canjea el código de 6 dígitos por el token (pair.py --yes)."""
+    """Canjea el código de 6 dígitos por el token (pair.py --yes).
+
+    Si falla, el error trae el motivo real que imprimió pair.py (código
+    vencido, sin red, TLS, …), no el genérico de antes.
+    """
     workdir = (workdir or default_dir()).expanduser().resolve()
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
@@ -334,14 +404,69 @@ def pair(workdir: Optional[Path] = None, back: str = DEFAULT_BACK,
     if not py.exists():
         raise RuntimeError("worker no instalado todavía")
     script = worker_dir(workdir) / "pair.py"
-    rc = run([py, script, "--back", back, "--code", code,
-              "--name", _name_flag(name), "--yes"],
-             cwd=worker_dir(workdir), timeout=60)
+    rc, lines = run_capture(
+        [py, script, "--back", back, "--code", code,
+         "--name", _name_flag(name), "--yes"],
+        cwd=worker_dir(workdir), timeout=60)
     if rc != 0:
-        if rc == 1:
-            raise RuntimeError("no pude emparejar: revisá el código y la conexión")
-        raise RuntimeError("código inválido o vencido — generá uno nuevo en la app")
+        raise RuntimeError(classify_pair_failure(rc, lines))
     logger.info("¡GPU conectada con %s!", back)
+
+
+def diagnose_back(back: str, timeout: float = 5.0) -> list:
+    """Diagnóstico por pasos contra el back (para "Diagnosticar conexión").
+
+    Devuelve [{step, ok, detail}]: URL → DNS → TCP → HTTP. Nunca lanza:
+    cada paso fallido explica qué revisar. Lo usa la GUI y el CLI.
+    """
+    from urllib.parse import urlparse
+
+    steps: list = []
+
+    def add(step: str, ok: bool, detail: str = "") -> None:
+        steps.append({"step": step, "ok": bool(ok), "detail": detail})
+
+    parsed = urlparse(back.strip())
+    if parsed.scheme not in ("http", "https"):
+        add("URL", False, f"debe empezar con http:// o https:// ({back!r})")
+        return steps
+    add("URL", True, f"{parsed.scheme}://{parsed.hostname or '?'}")
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError as exc:
+        add("DNS", False, f"no resolví {host}: {exc}")
+        return steps
+    add("DNS", True, f"{host} → {ip}")
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except OSError as exc:
+        add("TCP", False,
+            f"no llegué a {host}:{port} ({exc}): firewall, VPN o URL mal copiada")
+        return steps
+    add("TCP", True, f"{host}:{port} responde")
+
+    url = back.rstrip("/") + "/healthz"
+    try:
+        ctx = ssl.create_default_context(cafile=str(cacert_path() or "") or None)
+        req = urllib.request.Request(url, headers={"User-Agent": "SynaptaWorker-Setup"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            code = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+    except Exception as exc:  # noqa: BLE001 — el detalle ES el diagnóstico
+        add("HTTP", False, f"{url} falló: {exc}")
+        return steps
+    if code is not None and code < 400:
+        add("HTTP", True, f"{url} → {code}: el back está vivo")
+    else:
+        add("HTTP", False,
+            f"{url} → {code}: responde pero no es el back de Synapta")
+    return steps
 
 
 # ── proceso del worker ────────────────────────────────────────────
@@ -573,6 +698,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     p_pair.add_argument("--code", required=True)
     p_pair.add_argument("--name", default="")
 
+    p_diag = sub.add_parser("diagnose", help="diagnóstico por pasos contra el back")
+    p_diag.add_argument("--back", default=DEFAULT_BACK)
+
     sub.add_parser("start", help="arranca el worker")
     sub.add_parser("stop", help="detiene el worker")
     sub.add_parser("status", help="estado en JSON")
@@ -595,6 +723,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     skip_doctor=args.skip_doctor)
         elif args.cmd == "pair":
             pair(workdir, back=args.back, code=args.code, name=args.name)
+        elif args.cmd == "diagnose":
+            failed = False
+            for step in diagnose_back(args.back):
+                mark = "✓" if step["ok"] else "✘"
+                print(f"{mark} {step['step']}: {step['detail']}")
+                failed = failed or not step["ok"]
+            return 0 if not failed else 1
         elif args.cmd == "start":
             start(workdir)
         elif args.cmd == "stop":

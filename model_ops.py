@@ -46,6 +46,91 @@ _CANCEL_GRACE_S = 2.0
 # Hilos concurrentes de `snapshot_download` (1 hilo = 1 fichero a la vez).
 _DOWNLOAD_WORKERS = max(1, int(os.environ.get("BM_DOWNLOAD_WORKERS", "4")))
 
+# Modo de descarga de pesos (BM_PROVIDER_MODE):
+#   - "" / "personal" (default): NADA se descarga solo. Los pesos bajan
+#     únicamente cuando el admin pulsa Descargar en el panel /gpu (RPC
+#     DownloadModel). Generar con un modelo sin pesos falla con un mensaje
+#     claro en vez de saturar el PC con una descarga implícita de GB.
+#   - "shared": el worker es un proveedor compartido en la nube: al
+#     arrancar pre-descarga todo el catálogo y las generaciones pueden
+#     descargar implícitamente lo que falte.
+PROVIDER_MODE_PERSONAL = "personal"
+PROVIDER_MODE_SHARED = "shared"
+
+
+def provider_mode() -> str:
+    """Modo de descarga actual (se lee en cada llamada: testeable)."""
+    mode = os.environ.get("BM_PROVIDER_MODE", "").strip().lower()
+    return mode if mode == PROVIDER_MODE_SHARED else PROVIDER_MODE_PERSONAL
+
+
+def provider_shared() -> bool:
+    """true si el worker corre como proveedor compartido en la nube."""
+    return provider_mode() == PROVIDER_MODE_SHARED
+
+
+def key_for_repo(repo: str | None) -> str | None:
+    """Clave del catálogo para un repo (búsqueda inversa, o None)."""
+    if not repo:
+        return None
+    for key, spec in MODEL_CATALOG.items():
+        if spec.repo == repo:
+            return key
+    return None
+
+
+def weights_complete(repo: str | None) -> bool:
+    """true si los pesos del repo están completos en disco."""
+    if not repo:
+        return True  # mock / bridge: no hay pesos que esperar
+    return inspect_repo(repo).complete
+
+
+def require_weights(repo: str | None) -> None:
+    """Guardián anti-descargas-implícitas para los motores.
+
+    Llamar ANTES de `from_pretrained`: en modo personal, si los pesos no
+    están completos, falla rápido con un mensaje accionable en vez de
+    bajar GB en silencio durante una generación. En modo compartido no
+    hace nada (ahí sí tiene sentido descargar al vuelo).
+    """
+    if provider_shared() or weights_complete(repo):
+        return
+    key = key_for_repo(repo)
+    where = f"el modelo '{key}'" if key else f"los pesos de '{repo}'"
+    raise RuntimeError(
+        f"{where} no están descargados. Descargalos primero desde el "
+        "panel Tu GPU (/gpu → Modelos del worker → Descargar) y reintentá "
+        "la generación."
+    )
+
+
+def predownload_all(ops: "ModelOps") -> list[str]:
+    """Lanza la descarga de todo el catálogo con repo (modo compartido).
+
+    Devuelve las claves lanzadas; las que ya están en curso o completas se
+    omiten en silencio. Lo llama serve() al arrancar con BM_PROVIDER_MODE.
+    """
+    launched: list[str] = []
+    for key in ops.keys():
+        try:
+            spec = ops.spec(key)
+        except KeyError:
+            continue
+        if not spec.repo or spec.engine == "v1_bridge":
+            continue
+        if inspect_repo(spec.repo).complete:
+            continue
+        try:
+            ops.start_download(key)
+        except ValueError:
+            continue  # ya en curso: el hilo existente la termina
+        launched.append(key)
+    if launched:
+        logger.info("[model_ops] pre-descarga (modo compartido): %s",
+                    ", ".join(launched))
+    return launched
+
 # Extensiones que nunca hacen falta para ejecutar un modelo (documentación y
 # media del repo). Los .txt quedan fuera: vocab.txt/tokenizer.txt sí importan.
 _DOC_EXTS = {".md", ".markdown", ".rst", ".png", ".jpg", ".jpeg", ".gif",
@@ -427,6 +512,36 @@ class ModelOps:
         logger.info("[model_ops] %s descargado (%d bytes)", key, stats.on_disk)
 
     # ── borrado ────────────────────────────────────────────────────────
+    def delete_all(self) -> tuple[list[str], dict[str, str], int]:
+        """Borra los pesos de TODO el catálogo (opción "desinstalar todo").
+
+        Devuelve (borradas, fallidas, bytes_liberados). Las claves sin repo
+        (mock) o con descarga en curso no se tocan: van a `fallidas` con el
+        motivo, sin abortar el resto.
+        """
+        deleted: list[str] = []
+        failed: dict[str, str] = {}
+        freed = 0
+        for key in self.keys():
+            try:
+                spec = self.spec(key)
+            except KeyError:
+                continue
+            if not spec.repo:
+                continue  # mock: no ocupa disco, nada que borrar
+            on_disk = inspect_repo(spec.repo).on_disk
+            try:
+                self.delete(key)
+            except ValueError as exc:
+                failed[key] = str(exc)
+                continue
+            freed += on_disk
+            deleted.append(key)
+        if deleted:
+            logger.info("[model_ops] desinstalado todo: %d modelos (%d bytes)",
+                        len(deleted), freed)
+        return deleted, failed, freed
+
     def delete(self, key: str) -> ModelState:
         """Borra la caché del repo y libera el disco."""
         spec = self.spec(key)
