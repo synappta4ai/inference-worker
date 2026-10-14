@@ -15,4 +15,9 @@ Piezas:
 # Versión del agente bridge; viaja en el heartbeat para que el back detecte
 # workers desactualizados antes de un rollout (riesgo "versiones mezcladas"
 # del plan).
-BRIDGE_VERSION = "0.2.5"
+#
+# 0.2.6: el worker arregla el CA heredado del instalador (las descargas de
+# pesos volvían a fallar con "Permission denied" y no arrancaban nunca) y la
+# cancelación de descargas (corta también el camino Xet y descarta los restos
+# a medio bajar, que inflaban el tamaño/porcentaje que ve el panel).
+BRIDGE_VERSION = "0.2.6"
