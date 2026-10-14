@@ -31,7 +31,16 @@ try:
 except ImportError:  # PyInstaller empaqueta app.py como script raíz
     import core  # type: ignore[no-redef]
 
+try:
+    from bridge import BRIDGE_VERSION as WORKER_VERSION
+except ImportError:  # ejecutado fuera del paquete (tests sueltos)
+    try:
+        from ..bridge import BRIDGE_VERSION as WORKER_VERSION  # type: ignore[no-redef]
+    except ImportError:
+        WORKER_VERSION = "dev"
+
 APP_TITLE = "Synapta Worker"
+APP_VERSION = WORKER_VERSION
 FONT_FAMILY = "Segoe UI"
 
 # Colores del panel (dark-friendly, coherente con el front Synapta).
@@ -63,7 +72,7 @@ class InstallerApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(f"{APP_TITLE} v{APP_VERSION}")
         self.geometry("720x560")
         self.minsize(640, 480)
         self.configure(bg=BG)
@@ -112,7 +121,7 @@ class InstallerApp(tk.Tk):
     def _build_header(self) -> None:
         header = ttk.Frame(self, style="Bg.TFrame")
         header.pack(fill="x", padx=24, pady=(18, 6))
-        ttk.Label(header, text="Synapta Worker",
+        ttk.Label(header, text=f"Synapta Worker v{APP_VERSION}",
                   style="H1.TLabel").pack(side="left")
         ttk.Label(header, text="Instalador",
                   style="Bg.TLabel").pack(side="left", padx=(10, 0))
@@ -468,7 +477,7 @@ class InstallerApp(tk.Tk):
     # ── estado final ─────────────────────────────────────────────
     def refresh_done(self) -> None:
         st = core.worker_status(self.workdir)
-        parts = []
+        parts = [f"v{APP_VERSION}"]
         parts.append("Instalado ✓" if st["installed"] else "No instalado ✗")
         parts.append("GPU conectada ✓" if st["paired"]
                      else "Sin conectar ✗")
