@@ -56,7 +56,7 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 # URL raíz del back (el cliente la pega solo la primera vez; la app la
 # muestra en el diálogo de emparejamiento). SIN /api/v1: el bridge agrega
 # los paths completos del contrato.
-DEFAULT_BACK = os.environ.get("SYNAPTA_BACK", "https://back-dev.synapta.cloud")
+DEFAULT_BACK = os.environ.get("SYNAPTA_BACK", "https://back-dev.synappta.cloud")
 
 GRPC_PORT = 50051
 
