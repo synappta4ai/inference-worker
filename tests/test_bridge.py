@@ -28,6 +28,7 @@ class FakeBack(BaseHTTPRequestHandler):
     registered_codes = {"123456"}
     heartbeats: list = []
     cancel_ids: list = []
+    requested_models: list = []
     claimed_job: dict | None = None
     reports: list = []
     uploads: list = []
@@ -60,7 +61,9 @@ class FakeBack(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/v1/internal/workers/heartbeat"):
             self.heartbeats.append(json.loads(raw or b"{}"))
-            return self._json(200, {"success": True, "data": {"cancel_task_ids": self.cancel_ids}})
+            return self._json(200, {"success": True, "data": {
+                "cancel_task_ids": self.cancel_ids,
+                "requested_models": self.requested_models}})
         if self.path.startswith("/api/v1/internal/workers/claim"):
             job = self.claimed_job
             self.claimed_job = None  # solo una entrega
@@ -91,6 +94,7 @@ def fake_back():
     FakeBack.registered_codes = {"123456"}
     FakeBack.heartbeats, FakeBack.reports, FakeBack.uploads = [], [], []
     FakeBack.cancel_ids, FakeBack.claimed_job = [], None
+    FakeBack.requested_models = []
     FakeBack.revoked = False
     server = HTTPServer(("127.0.0.1", 0), FakeBack)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -203,10 +207,29 @@ def test_client_register_bad_code(fake_back):
 def test_client_heartbeat_returns_cancels(fake_back):
     FakeBack.cancel_ids = ["syn_77"]
     client = BridgeClient(fake_back, token="tok-secret")
-    cancels = client.heartbeat(gpu_name="RTX", version="0.1.0",
-                               vram_free_mb=100, jobs_active=0, models=[])
-    assert cancels == ["syn_77"]
+    res = client.heartbeat(gpu_name="RTX", version="0.1.0",
+                           vram_free_mb=100, jobs_active=0, models=[])
+    assert res["cancel_task_ids"] == ["syn_77"]
+    assert res["requested_models"] == []
     assert FakeBack.heartbeats[-1]["gpu_name"] == "RTX"
+
+
+def test_client_heartbeat_download_queue(fake_back):
+    """El panel encola descargas: viajan como requested_models y el
+    agente las confirma con completed_downloads en el próximo latido."""
+    FakeBack.requested_models = ["FLUX.1-dev"]
+    client = BridgeClient(fake_back, token="tok-secret")
+    res = client.heartbeat(gpu_name="RTX", version="0.2.5",
+                           vram_free_mb=100, jobs_active=0, models=[])
+    assert res["requested_models"] == ["FLUX.1-dev"]
+    assert FakeBack.heartbeats[-1].get("completed_downloads", []) == []
+    # Segundo latido: el agente ya tomó la descarga y hace ack.
+    FakeBack.requested_models = []
+    res2 = client.heartbeat(gpu_name="RTX", version="0.2.5",
+                            vram_free_mb=100, jobs_active=0, models=[],
+                            completed_downloads=["FLUX.1-dev"])
+    assert res2["requested_models"] == []
+    assert FakeBack.heartbeats[-1]["completed_downloads"] == ["FLUX.1-dev"]
 
 
 def test_client_heartbeat_rejects_bad_token(fake_back):
@@ -302,3 +325,41 @@ def test_gpu_snapshot_shape():
     assert isinstance(snap["models"], list) and snap["models"]
     first = snap["models"][0]
     assert {"key", "label", "mode", "engine", "vram_gb", "available"} <= set(first)
+
+
+def test_gpu_snapshot_fails_closed_without_local_state(monkeypatch):
+    """Sin estado del gRPC local los modelos viajan como NO disponibles.
+
+    El default viejo (`available=True`) dejaba el panel mostrando todo
+    "Disponible" en una máquina sin pesos: el botón Descargar solo aparece
+    para los no disponibles, así que no había forma de bajarlos.
+    """
+    import bridge.agent as agent
+
+    monkeypatch.setattr(agent, "_local_model_states", lambda: {})
+    snap = agent.gpu_snapshot()
+    assert snap["models"]
+    assert all(m["available"] is False for m in snap["models"])
+    assert all(m["download_percent"] == 0.0 for m in snap["models"])
+
+
+def test_gpu_snapshot_reports_local_weight_state(monkeypatch):
+    """El estado real de pesos (disponible / descargando / %) viaja tal cual."""
+    import bridge.agent as agent
+
+    monkeypatch.setattr(agent, "_local_model_states", lambda: {
+        "SD-Tiny-Test": {"available": True, "downloading": False,
+                         "download_percent": 100.0, "size_bytes": 8_832_013,
+                         "download_error": ""},
+        "SD-1.5": {"available": False, "downloading": True,
+                   "download_percent": 17.8, "size_bytes": 9_014_119_167,
+                   "download_error": ""},
+    })
+    snap = agent.gpu_snapshot()
+    by_key = {m["key"]: m for m in snap["models"]}
+    assert by_key["SD-Tiny-Test"]["available"] is True
+    assert by_key["SD-Tiny-Test"]["size_bytes"] == 8_832_013
+    assert by_key["SD-1.5"]["downloading"] is True
+    assert by_key["SD-1.5"]["download_percent"] == 17.8
+    # Clave sin estado: nunca se inventa disponibilidad.
+    assert by_key["Wan2.1-T2V-14B"]["available"] is False

@@ -47,12 +47,61 @@ HEARTBEAT_INTERVAL = 20.0
 LOCAL_GRPC = "127.0.0.1:50051"
 
 
+def _local_model_states() -> dict:
+    """Estado real de pesos vía gRPC local (disponible/descargando/%).
+
+    El agente y el servidor viven en el mismo proceso (run.py): el snapshot
+    que viaja en el heartbeat refleja disco de verdad, no un
+    `available=True` fijo. Si el gRPC aún no levantó, {} (fallback abajo).
+    """
+    try:
+        with grpc.insecure_channel(LOCAL_GRPC) as channel:
+            stub = inference_pb2_grpc.InferenceServiceStub(channel)
+            resp = stub.ListModels(inference_pb2.ListModelsRequest(), timeout=8)
+    except Exception as exc:  # noqa: BLE001 — snapshot best-effort, nunca bloquea
+        # Sin este log, un gRPC local que no responde se veía en el panel
+        # como "todos los modelos disponibles" y no había forma de saber por qué.
+        logger.warning("[bridge] el gRPC local (%s) no devolvió el estado de "
+                       "pesos: %s. Los modelos viajan como no disponibles "
+                       "hasta que responda.", LOCAL_GRPC, exc)
+        return {}
+    out = {}
+    try:
+        for m in resp.models:
+            out[m.key] = {
+                "available": bool(m.available),
+                "downloading": bool(m.downloading),
+                "download_percent": float(m.download_percent or 0.0),
+                "size_bytes": int(m.size_bytes or 0),
+                "download_error": str(m.download_error or ""),
+            }
+    except Exception as exc:  # noqa: BLE001 — proto parcial: lo que haya sirve
+        logger.warning("[bridge] snapshot de pesos incompleto: %s", exc)
+    return out
+
+
 def gpu_snapshot() -> dict:
-    """Telemetría de GPU + catálogo, en el formato que espera el back."""
+    """Telemetría de GPU + catálogo, en el formato que espera el back.
+
+    El estado de pesos (available/downloading/%) sale del gRPC local. Si el
+    gRPC no responde, el modelo viaja como NO disponible: inventar
+    disponibilidad deja el panel sin botón "Descargar" para un modelo que no
+    está en disco (el usuario no tiene cómo bajarlo) y manda a generar con
+    pesos que no existen.
+    """
     tel = VRAMManager.get_telemetry()
     from engines.registry import list_models
-    models = [
-        {
+    catalog = list_models()
+    states = _local_model_states()
+    if catalog and not states:
+        logger.warning("[bridge] snapshot sin estado de pesos: los %d modelos "
+                       "del catálogo se reportan como no disponibles",
+                       len(catalog))
+    models = []
+    for m in catalog:
+        st = states.get(m["id"], {})
+        available = bool(st.get("available", False))
+        models.append({
             "key": m["id"],
             "label": m["name"],
             "mode": m["mode"],
@@ -62,11 +111,14 @@ def gpu_snapshot() -> dict:
             "steps": m["steps"],
             "vram_gb": m["vram_gb"],
             "family": m["family"],
-            "available": True,
+            "available": available,
+            "downloading": bool(st.get("downloading", False)),
+            "download_percent": float(st.get("download_percent",
+                                          100.0 if available else 0.0)),
+            "size_bytes": int(st.get("size_bytes", 0)),
+            "download_error": str(st.get("download_error", "")),
             "notes": m.get("notes") or "",
-        }
-        for m in list_models()
-    ]
+        })
     return {
         "gpu_name": tel.get("device_name", "CPU / No CUDA"),
         "vram_total_mb": int(tel.get("total_vram_mb", 0)),
@@ -143,18 +195,30 @@ class Agent:
     # ─── heartbeat ──────────────────────────────────────────────
 
     def _heartbeat_loop(self) -> None:
+        # Descargas pedidas desde el panel ya tomadas: se confirman (ack)
+        # en el próximo heartbeat para sacarlas de la cola del back.
+        pending_acks: list[str] = []
         while not self._stop.is_set():
             snap = gpu_snapshot()
             try:
-                cancels = self.client.heartbeat(
+                res = self.client.heartbeat(
                     gpu_name=snap["gpu_name"],
                     version=BRIDGE_VERSION,
                     vram_free_mb=snap["vram_free_mb"],
                     jobs_active=self._jobs_active,
                     models=snap["models"],
+                    completed_downloads=pending_acks,
                 )
-                for task_id in cancels:
-                    self._cancel_local(task_id)
+                pending_acks = []
+                cancels = res.get("cancel_task_ids", [])
+                if isinstance(cancels, list):
+                    for task_id in cancels:
+                        self._cancel_local(task_id)
+                requested = res.get("requested_models", [])
+                if isinstance(requested, list):
+                    for key in requested:
+                        if self._start_remote_download(str(key)):
+                            pending_acks.append(str(key))
             except BridgeError as exc:
                 # Token revocado → el admin desemparejó la GPU: parar.
                 if exc.status == 401:
@@ -164,6 +228,36 @@ class Agent:
                     return
                 logger.warning("[bridge] heartbeat falló: %s", exc)
             self._stop.wait(HEARTBEAT_INTERVAL)
+
+    def _start_remote_download(self, key: str) -> bool:
+        """Dispara DownloadModel en el gRPC local (pedido del panel).
+
+        Devuelve True si el back puede darlo por tomado (descarga lanzada
+        o ya en curso/completa): el progreso real viaja en el snapshot.
+        False solo si la clave es desconocida o el gRPC no responde — en
+        ese caso NO se hace ack y el back lo reintenta en el próximo loop.
+        """
+        key = (key or "").strip()
+        if not key:
+            return False
+        try:
+            with grpc.insecure_channel(self.local_grpc) as channel:
+                stub = inference_pb2_grpc.InferenceServiceStub(channel)
+                stub.DownloadModel(
+                    inference_pb2.DownloadModelRequest(key=key), timeout=30
+                )
+            logger.info("[bridge] descarga pedida desde el panel: %s", key)
+            return True
+        except grpc.RpcError as exc:
+            code = exc.code() if hasattr(exc, "code") else None
+            # Clave desconocida o precondición (mock/bridge V1): no reintentar.
+            name = str(getattr(code, "name", code))
+            if name in ("NOT_FOUND", "FAILED_PRECONDITION", "INVALID_ARGUMENT"):
+                logger.warning("[bridge] descarga %s rechazada (%s): %s",
+                               key, name, exc.details() if hasattr(exc, "details") else exc)
+                return True
+            logger.warning("[bridge] descarga %s no lanzada, reintento luego: %s", key, exc)
+            return False
 
     def _cancel_local(self, task_id: str) -> None:
         """Pide al gRPC local abortar el job en curso (si es este agente)."""

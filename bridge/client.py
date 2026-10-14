@@ -131,17 +131,31 @@ class BridgeClient:
         })
 
     def heartbeat(self, gpu_name: str, version: str, vram_free_mb: int,
-                  jobs_active: int, models: list) -> list:
-        """Refresh del estado vivo. Devuelve los task_id a cancelar."""
+                  jobs_active: int, models: list,
+                  completed_downloads: Optional[list] = None) -> dict:
+        """Refresh del estado vivo.
+
+        Devuelve {"cancel_task_ids": [...], "requested_models": [...]}:
+        cancelaciones de jobs en curso + descargas que el admin pidió
+        desde el panel (el agente las dispara contra el gRPC local y las
+        confirma con completed_downloads en el próximo heartbeat).
+        """
         data = self._request("POST", "/api/v1/internal/workers/heartbeat", {
             "gpu_name": gpu_name,
             "version": version,
             "vram_free_mb": vram_free_mb,
             "jobs_active": jobs_active,
             "models": models,
+            "completed_downloads": list(completed_downloads or []),
         })
-        ids = data.get("cancel_task_ids") if isinstance(data, dict) else None
-        return list(ids) if isinstance(ids, list) else []
+        if not isinstance(data, dict):
+            return {"cancel_task_ids": [], "requested_models": []}
+        cancels = data.get("cancel_task_ids")
+        requested = data.get("requested_models")
+        return {
+            "cancel_task_ids": list(cancels) if isinstance(cancels, list) else [],
+            "requested_models": list(requested) if isinstance(requested, list) else [],
+        }
 
     def claim(self, wait_seconds: int = 25) -> Optional[Job]:
         """Long-poll: espera un trabajo hasta wait_seconds; None = cola vacía."""
