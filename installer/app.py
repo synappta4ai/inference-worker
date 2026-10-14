@@ -176,6 +176,10 @@ class InstallerApp(tk.Tk):
                   "código de 6 dígitos y pegalo acá (Ctrl+V)."),
         ).pack(anchor="w", pady=(4, 16))
 
+        self.paired_banner = ttk.Label(card, text="", style="Muted.TLabel",
+                                       wraplength=620)
+        self.paired_banner.pack(anchor="w", pady=(0, 8))
+
         ttk.Label(card, text="URL de tu Synapta",
                   style="Muted.TLabel").pack(anchor="w")
         self.back_var = tk.StringVar(value=core.DEFAULT_BACK)
@@ -227,6 +231,23 @@ class InstallerApp(tk.Tk):
             variable=self.autostart_var, command=self.on_autostart,
         ).pack(anchor="w", pady=(0, 14))
 
+        ttk.Label(card, text="Últimos eventos (sin terminal):",
+                  style="Muted.TLabel").pack(anchor="w", pady=(6, 2))
+        self.done_log = tk.Text(
+            card, height=8, wrap="word", state="disabled",
+            bg="#0b1120", fg="#d1d5db", insertbackground=FG,
+            relief="flat", font=("Consolas", 9), padx=8, pady=8,
+        )
+        self.done_log.pack(fill="both", expand=True, pady=(0, 8))
+        logbtns = ttk.Frame(card, style="Card.TFrame")
+        logbtns.pack(fill="x", pady=(0, 10))
+        ttk.Button(logbtns, text="Actualizar eventos",
+                   command=self.refresh_logs).pack(side="left", ipady=2)
+        ttk.Button(logbtns, text="Abrir carpeta de logs",
+                   command=self.on_open_logs).pack(side="left", padx=(8, 0), ipady=2)
+        ttk.Button(logbtns, text="Copiar diagnóstico",
+                   command=self.on_copy_diag).pack(side="left", padx=(8, 0), ipady=2)
+
         btns = ttk.Frame(card, style="Card.TFrame")
         btns.pack(fill="x")
         self.start_btn = ttk.Button(btns, text="Detener worker",
@@ -244,6 +265,8 @@ class InstallerApp(tk.Tk):
         self.screens[name].tkraise()
         if name == "done":
             self.refresh_done()
+        elif name == "pair":
+            self.refresh_pair_banner()
 
     @staticmethod
     def _digit_code(value: str) -> bool:
@@ -302,11 +325,38 @@ class InstallerApp(tk.Tk):
 
         self._run_bg(job, ok)
 
+    def refresh_pair_banner(self) -> None:
+        """Avisa a qué back ya está atada la máquina (códigos no son portables)."""
+        try:
+            st = core.worker_status(self.workdir)
+        except Exception:  # noqa: BLE001 — banner informativo, nunca bloquea
+            return
+        if st.get("paired") and st.get("back_url"):
+            self.paired_banner.configure(
+                text=f"Esta máquina ya está conectada a {st['back_url']}. "
+                     "Si la querés pasar a otra URL, pegá un código NUEVO de esa app.")
+        else:
+            self.paired_banner.configure(text="")
+
     def on_pair(self) -> None:
         if self.busy:
             return
         code = self.code_var.get().strip()
-        back = self.back_var.get().strip()
+        back = core.normalize_back_url(self.back_var.get())
+        self.back_var.set(back)
+        fixed = core.suggest_back_fix(back)
+        if fixed:
+            back = fixed
+            self.back_var.set(back)
+            self.pair_msg.configure(
+                text=f"Corregí la URL a {back} (era un typo común). Generá un código nuevo y reintentá.")
+            return
+        try:
+            hint = core.back_mismatch_hint(back)
+        except Exception:  # noqa: BLE001 — hint opcional
+            hint = ""
+        if hint:
+            self.paired_banner.configure(text="⚠ " + hint)
         if len(code) != 6 or not code.isdigit():
             self.pair_msg.configure(
                 text="Pegá el código de 6 dígitos que muestra la app.")
@@ -379,6 +429,42 @@ class InstallerApp(tk.Tk):
 
         self._run_bg(job, ok)
 
+    def refresh_logs(self) -> None:
+        """Volca el tail del worker.log en la pantalla Listo (sin PowerShell)."""
+        try:
+            text = core.worker_log_tail(self.workdir)
+        except Exception as exc:  # noqa: BLE001 — mostrar, no romper
+            text = f"no pude leer los logs: {exc}"
+        self.done_log.configure(state="normal")
+        self.done_log.delete("1.0", "end")
+        self.done_log.insert("end", text)
+        self.done_log.see("end")
+        self.done_log.configure(state="disabled")
+
+    def on_open_logs(self) -> None:
+        import os as _os
+        import subprocess as _sp
+        folder = str(core.log_dir(self.workdir))
+        try:
+            if _os.name == "nt":
+                _os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                _sp.Popen(["open", folder])
+            else:
+                _sp.Popen(["xdg-open", folder])
+        except Exception as exc:  # noqa: BLE001 — user-facing
+            messagebox.showwarning(APP_TITLE, f"No pude abrir {folder}: {exc}")
+
+    def on_copy_diag(self) -> None:
+        try:
+            text = core.worker_log_tail(self.workdir)
+        except Exception as exc:  # noqa: BLE001 — user-facing
+            messagebox.showwarning(APP_TITLE, f"No pude leer los logs: {exc}")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        messagebox.showinfo(APP_TITLE, "Diagnóstico copiado: pegalo en el chat de soporte.")
+
     # ── estado final ─────────────────────────────────────────────
     def refresh_done(self) -> None:
         st = core.worker_status(self.workdir)
@@ -394,6 +480,7 @@ class InstallerApp(tk.Tk):
         self.start_btn.configure(
             text="Detener worker" if st["running"] else "Iniciar worker")
         self.autostart_var.set(core.autostart_enabled())
+        self.refresh_logs()
 
     # ── cola de logs/errores ─────────────────────────────────────
     def _log_line(self, text: str) -> None:

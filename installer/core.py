@@ -332,6 +332,56 @@ def install(workdir: Optional[Path] = None,
     return workdir
 
 
+def normalize_back_url(back: str) -> str:
+    """Normaliza la URL que pega el usuario (sin terminal ni edición manual).
+
+    - quita espacios y `/` final
+    - quita sufijo `/api/v1` si lo pegó desde el front (el bridge ya lo agrega;
+      dejarlo duplicaría el path y daría 404)
+    """
+    b = (back or "").strip().rstrip("/")
+    low = b.lower()
+    for suffix in ("/api/v1", "/api", "/api/v1/", "/api/"):
+        if low.endswith(suffix):
+            b = b[: -len(suffix)].rstrip("/")
+            low = b.lower()
+            break
+    return b
+
+
+def suggest_back_fix(back: str) -> str:
+    """Si la URL tiene el typo más común, devuelve la corregida o "".
+
+    Caso real visto en soporte: `synapta.cloud` (una p) en vez de
+    `synappta.cloud` (doble p). Con una p el DNS apunta a otro lado y el
+    emparejamiento falla con "sin conexión" aunque el código sea válido.
+    """
+    b = (back or "").strip()
+    if "synapta.cloud" in b.lower() and "synappta" not in b.lower():
+        return b.lower().replace("synapta.cloud", "synappta.cloud")
+    return ""
+
+
+def back_mismatch_hint(new_back: str) -> str:
+    """Aviso si ya está emparejado a otro back (ej. localhost vs nube).
+
+    El código que muestra la app solo vale en el back que lo emitió: un
+    código de `back-dev.synappta.cloud` nunca canjea contra
+    `http://localhost:8099` y viceversa. Sin este aviso el usuario reintenta
+    el mismo código en el back equivocado hasta que vence.
+    """
+    try:
+        paired, current, _ = _pairing()
+    except NameError:
+        return ""
+    if not paired or not current:
+        return ""
+    if normalize_back_url(current).lower() != normalize_back_url(new_back).lower():
+        return (f"esta máquina ya está conectada a {current}; el código nuevo "
+                f"solo vale en {new_back.strip()}. Al conectar se reemplaza.")
+    return ""
+
+
 def _name_flag(name: str = "") -> str:
     if not name:
         host = platform.node() or socket.gethostname() or "GPU"
@@ -396,10 +446,15 @@ def pair(workdir: Optional[Path] = None, back: str = DEFAULT_BACK,
     """
     workdir = (workdir or default_dir()).expanduser().resolve()
     code = code.strip()
+    back = normalize_back_url(back)
     if len(code) != 6 or not code.isdigit():
         raise RuntimeError(f"el código debe tener 6 dígitos (recibido: {code!r})")
     if not back.startswith(("http://", "https://")):
         raise RuntimeError(f"URL inválida: {back!r}")
+    fixed = suggest_back_fix(back)
+    if fixed and fixed.lower() != back.lower():
+        logger.info("corrijo URL: %s → %s", back, fixed)
+        back = fixed
     py = python_path(workdir)
     if not py.exists():
         raise RuntimeError("worker no instalado todavía")
@@ -421,7 +476,18 @@ def diagnose_back(back: str, timeout: float = 5.0) -> list:
     """
     from urllib.parse import urlparse
 
+    back = normalize_back_url(back)
     steps: list = []
+    typo_note = ""
+    fixed = suggest_back_fix(back)
+    if fixed:
+        typo_note = f" (typo? quisiste decir {fixed})"
+        back = fixed
+    localhost_note = ""
+    low = back.lower()
+    if "localhost" in low and "127.0.0.1" not in low:
+        localhost_note = (" · AVISO: localhost es esta PC, un código de la nube "
+                          "NO vale acá")
 
     def add(step: str, ok: bool, detail: str = "") -> None:
         steps.append({"step": step, "ok": bool(ok), "detail": detail})
@@ -430,7 +496,7 @@ def diagnose_back(back: str, timeout: float = 5.0) -> list:
     if parsed.scheme not in ("http", "https"):
         add("URL", False, f"debe empezar con http:// o https:// ({back!r})")
         return steps
-    add("URL", True, f"{parsed.scheme}://{parsed.hostname or '?'}")
+    add("URL", True, f"{parsed.scheme}://{parsed.hostname or '?'}{typo_note}{localhost_note}")
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
@@ -547,6 +613,32 @@ def stop(workdir: Optional[Path] = None) -> None:
     else:
         logger.info("worker no estaba corriendo")
     pidf.unlink(missing_ok=True)
+
+
+def log_dir(workdir: Optional[Path] = None) -> Path:
+    """Carpeta con worker.log / autostart.log (para el botón «Abrir logs»)."""
+    return (workdir or default_dir()).expanduser().resolve()
+
+
+def worker_log_tail(workdir: Optional[Path] = None, lines: int = 25) -> str:
+    """Últimas líneas del worker.log + a qué back apunta (sin token).
+
+    Para que el usuario final nunca abra PowerShell: la GUI lo muestra en la
+    pantalla «Listo» y el botón «Copiar diagnóstico» lo pone en el portapapeles.
+    """
+    wd = log_dir(workdir)
+    _, back_url, worker_id = _pairing()
+    head = f"back: {back_url or '(sin emparejar)'}"
+    if worker_id:
+        head += f" · worker {worker_id[:8]}…"
+    tail = _tail(wd / "worker.log", lines)
+    # WinError 10061 = el back no escucha ahí (típico: localhost en vez de nube).
+    hint = ""
+    if "WinError 10061" in tail or "connection refused" in tail.lower():
+        hint = ("\n\nPISTA: «conexión denegada» = el back no escucha en esa URL. "
+                "Si dice localhost:8099, re-emparejá contra "
+                "https://back-dev.synappta.cloud con un código nuevo.")
+    return f"{head}\n{tail}{hint}"
 
 
 def _tail(path: Path, lines: int = 12) -> str:
