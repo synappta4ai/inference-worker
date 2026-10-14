@@ -320,6 +320,78 @@ def test_pair_ok_swallows_nothing(tmp_path, monkeypatch):
     core.pair(tmp_path, back="http://localhost:9999", code="123456")  # no lanza
 
 
+# ── descarga del payload (fallback sin intervención) ─────────────
+def _serve_zip(zip_bytes, wrong_type=False):
+    import http.server
+    import threading
+
+    class Zip(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html>cautivo</html>" if wrong_type else zip_bytes
+            ctype = "text/html" if wrong_type else "application/zip"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Zip)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _worker_zip(tmp_path):
+    repo = tmp_path / "repo"
+    _make_repo(repo, {"run.py": "print('ok')\n",
+                       "pair.py": "# pair\n",
+                       "requirements.txt": "x\n"})
+    dest = tmp_path / "worker.zip"
+    core.build_payload(repo, dest)
+    return dest.read_bytes()
+
+
+def test_download_payload_roundtrip(tmp_path):
+    blob = _worker_zip(tmp_path)
+    srv = _serve_zip(blob)
+    try:
+        out = core.download_payload(
+            f"http://127.0.0.1:{srv.server_port}/w.zip", tmp_path / "d.zip")
+    finally:
+        srv.shutdown()
+    assert out.exists()
+    with zipfile.ZipFile(out) as zf:
+        assert {"run.py", "pair.py", "requirements.txt"} <= set(zf.namelist())
+
+
+def test_download_payload_rejects_non_worker(tmp_path):
+    srv = _serve_zip(b"", wrong_type=True)
+    try:
+        with pytest.raises(RuntimeError):
+            core.download_payload(
+                f"http://127.0.0.1:{srv.server_port}/w.zip", tmp_path / "d.zip")
+    finally:
+        srv.shutdown()
+
+
+def test_extract_fallback_downloads_when_blocked(tmp_path, monkeypatch):
+    """Embebido bloqueado → descarga y extrae sin pedir nada."""
+    blob = _worker_zip(tmp_path)
+    srv = _serve_zip(blob)
+    monkeypatch.setattr(core.time, "sleep", lambda *a: None)
+    try:
+        target = tmp_path / "install" / "worker"
+        core._extract_with_fallback(
+            tmp_path / "no-existe.zip", target,
+            payload_url=f"http://127.0.0.1:{srv.server_port}/w.zip",
+            workdir=tmp_path / "install")
+    finally:
+        srv.shutdown()
+    assert (target / "run.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
 # ── diagnose_back (servidor HTTP local, sin internet) ────────────
 def _serve_health(tmp_path):
     import functools

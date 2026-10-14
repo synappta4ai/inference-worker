@@ -58,6 +58,19 @@ TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 # los paths completos del contrato.
 DEFAULT_BACK = os.environ.get("SYNAPTA_BACK", "https://back-dev.synappta.cloud")
 
+# Zip del worker ya publicado (el mismo que ofrece el panel Tu GPU): si el
+# antivirus bloquea el payload embebido en el .exe, el instalador lo descarga
+# de acá sin pedirle nada al usuario. Se puede overridear con la variable
+# SYNAPTA_PAYLOAD_URL o el flag --payload-url (builds de prod apuntan a su
+# propio front).
+PAYLOAD_URL = os.environ.get(
+    "SYNAPTA_PAYLOAD_URL",
+    "https://front-dev.synappta.cloud/assets/worker/synapta-worker.zip")
+
+# Archivos que todo payload válido trae: si el zip descargado no los tiene,
+# no es el worker (proxy cautivo, html de error, …) y se rechaza.
+PAYLOAD_REQUIRED = ("run.py", "pair.py", "requirements.txt")
+
 GRPC_PORT = 50051
 
 # ── payload ───────────────────────────────────────────────────────
@@ -329,16 +342,72 @@ def run_doctor(py: Path, workdir: Path) -> None:
             "el doctor encontró bloqueos (mirá el reporte arriba)")
 
 
+def download_payload(url: str, dest: Path, timeout: float = 60.0) -> Path:
+    """Baja el zip del worker y valida que sea el worker (no un html)."""
+    logger.info("descargando worker desde %s …", url)
+    req = urllib.request.Request(url, headers={"User-Agent": "SynaptaWorker-Setup"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_tls_context()) as resp:
+            blob = resp.read()
+    except Exception as exc:  # noqa: BLE001 — el mensaje ES user-facing
+        raise RuntimeError(f"no pude descargar el worker ({exc}): revisá tu "
+                           "conexión a internet") from None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(blob)
+    try:
+        with zipfile.ZipFile(dest) as zf:
+            names = set(zf.namelist())
+    except Exception:
+        raise RuntimeError("la descarga no es un zip válido; reintentá") from None
+    missing = [n for n in PAYLOAD_REQUIRED if n not in names]
+    if missing:
+        raise RuntimeError(
+            f"la descarga no trae el worker (falta {', '.join(missing)}); "
+            "reintentá")
+    logger.info("worker descargado (%d KB) ✓", len(blob) // 1024)
+    return dest
+
+
+def _extract_with_fallback(zip_path: Path, target: Path,
+                           payload_url: Optional[str] = None,
+                           workdir: Optional[Path] = None) -> None:
+    """Extrae el embebido; si el antivirus lo bloquea, descarga el zip.
+
+    El usuario no elige nada: el instalador prueba solo y sigue. El zip
+    descargado es el mismo que publica el panel Tu GPU.
+    """
+    try:
+        extract_payload(zip_path, target)
+        return
+    except (RuntimeError, OSError) as exc:
+        if (isinstance(exc, RuntimeError)
+                and "antivirus" not in str(exc).lower()
+                and "permiso" not in str(exc).lower()):
+            raise
+        url = (payload_url or PAYLOAD_URL).strip()
+        logger.warning("embebido bloqueado: pruebo descargar desde %s", url)
+    dest = (workdir or target.parent) / "_payload-download.zip"
+    download_payload(url, dest)
+    extract_payload(dest, target)
+    try:
+        dest.unlink()
+    except OSError:
+        pass
+
+
 # ── orquestación ──────────────────────────────────────────────────
 def install(workdir: Optional[Path] = None,
             payload: Optional[Path] = None,
-            skip_doctor: bool = False) -> Path:
+            skip_doctor: bool = False,
+            payload_url: Optional[str] = None) -> Path:
     """Instalación completa. Lanza RuntimeError con mensaje user-facing."""
     workdir = (workdir or default_dir()).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     logger.info("instalando en %s", workdir)
 
-    extract_payload(payload_source(payload), worker_dir(workdir))
+    _extract_with_fallback(payload_source(payload), worker_dir(workdir),
+                           payload_url=payload_url, workdir=workdir)
     py = ensure_python(workdir)
     ensure_pip(py, workdir)
     install_deps(py, workdir)
@@ -553,13 +622,11 @@ def diagnose_back(back: str, timeout: float = 5.0) -> list:
     return steps
 
 
-def _diagnostic_ssl_context() -> "ssl.SSLContext":
-    """TLS solo para el paso HTTP del diagnóstico.
+def _tls_context() -> "ssl.SSLContext":
+    """TLS para el instalador (diagnóstico y descarga del payload).
 
     Prefiere el CA embebido, pero si el .exe no puede leerlo (antivirus o
-    ACLs del dir temporal → Permission denied), cae al contexto del sistema:
-    lo que se quiere probar es la red, no el bundle. Sin este fallback el
-    paso HTTP daba un falso ✕ con URL/DNS/TCP en verde.
+    ACLs del dir temporal → Permission denied), cae al contexto del sistema.
     """
     ca = cacert_path()
     if ca is not None:
@@ -568,6 +635,11 @@ def _diagnostic_ssl_context() -> "ssl.SSLContext":
         except OSError:
             pass
     return ssl.create_default_context()
+
+
+# Compat: el diagnóstico lo llamaba con este nombre.
+def _diagnostic_ssl_context() -> "ssl.SSLContext":
+    return _tls_context()
 
 
 # ── proceso del worker ────────────────────────────────────────────
@@ -818,6 +890,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     p_ins = sub.add_parser("install", help="instala Python + dependencias")
     p_ins.add_argument("--payload", type=Path, default=None)
+    p_ins.add_argument("--payload-url", default=None,
+                       help="URL del zip si el embebido está bloqueado "
+                            "(default: SYNAPTA_PAYLOAD_URL o el del front)")
     p_ins.add_argument("--skip-doctor", action="store_true")
 
     p_pair = sub.add_parser("pair", help="empareja con el código de la app")
@@ -847,7 +922,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     try:
         if args.cmd == "install":
             install(workdir, payload=args.payload,
-                    skip_doctor=args.skip_doctor)
+                    skip_doctor=args.skip_doctor,
+                    payload_url=args.payload_url)
         elif args.cmd == "pair":
             pair(workdir, back=args.back, code=args.code, name=args.name)
         elif args.cmd == "diagnose":
