@@ -70,10 +70,12 @@ def _local_model_states() -> dict:
         for m in resp.models:
             out[m.key] = {
                 "available": bool(m.available),
+                "downloaded": bool(m.downloaded),
                 "downloading": bool(m.downloading),
                 "download_percent": float(m.download_percent or 0.0),
                 "size_bytes": int(m.size_bytes or 0),
                 "download_error": str(m.download_error or ""),
+                "download_path": str(m.download_path or ""),
             }
     except Exception as exc:  # noqa: BLE001 — proto parcial: lo que haya sirve
         logger.warning("[bridge] snapshot de pesos incompleto: %s", exc)
@@ -112,11 +114,13 @@ def gpu_snapshot() -> dict:
             "vram_gb": m["vram_gb"],
             "family": m["family"],
             "available": available,
+            "downloaded": bool(st.get("downloaded", False)),
             "downloading": bool(st.get("downloading", False)),
             "download_percent": float(st.get("download_percent",
                                           100.0 if available else 0.0)),
             "size_bytes": int(st.get("size_bytes", 0)),
             "download_error": str(st.get("download_error", "")),
+            "download_path": str(st.get("download_path", "")),
             "notes": m.get("notes") or "",
         })
     return {

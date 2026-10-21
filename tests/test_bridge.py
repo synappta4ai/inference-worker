@@ -348,18 +348,25 @@ def test_gpu_snapshot_reports_local_weight_state(monkeypatch):
     import bridge.agent as agent
 
     monkeypatch.setattr(agent, "_local_model_states", lambda: {
-        "SD-Tiny-Test": {"available": True, "downloading": False,
+        "SD-Tiny-Test": {"available": True, "downloaded": True,
+                         "downloading": False,
                          "download_percent": 100.0, "size_bytes": 8_832_013,
-                         "download_error": ""},
-        "SD-1.5": {"available": False, "downloading": True,
+                         "download_error": "",
+                         "download_path": r"C:\Users\x\.cache\huggingface\hub\models--org--demo"},
+        "SD-1.5": {"available": False, "downloaded": False,
+                   "downloading": True,
                    "download_percent": 17.8, "size_bytes": 9_014_119_167,
-                   "download_error": ""},
+                   "download_error": "", "download_path": ""},
     })
     snap = agent.gpu_snapshot()
     by_key = {m["key"]: m for m in snap["models"]}
     assert by_key["SD-Tiny-Test"]["available"] is True
     assert by_key["SD-Tiny-Test"]["size_bytes"] == 8_832_013
+    # La ruta de los pesos viaja al back: sin esto el panel no puede mostrarla.
+    assert by_key["SD-Tiny-Test"]["downloaded"] is True
+    assert by_key["SD-Tiny-Test"]["download_path"].endswith("models--org--demo")
     assert by_key["SD-1.5"]["downloading"] is True
     assert by_key["SD-1.5"]["download_percent"] == 17.8
+    assert by_key["SD-1.5"]["download_path"] == ""
     # Clave sin estado: nunca se inventa disponibilidad.
     assert by_key["Wan2.1-T2V-14B"]["available"] is False

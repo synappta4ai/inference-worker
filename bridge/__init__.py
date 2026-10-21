@@ -24,4 +24,8 @@ Piezas:
 # 0.2.7: el catálogo (ListModels) reporta la ruta de los pesos en disco
 # (download_path), así el back y el panel ubican los archivos sin adivinar el
 # slug de la caché. Un worker 0.2.6 sigue funcionando: sólo omite el campo.
-BRIDGE_VERSION = "0.2.7"
+#
+# 0.2.8: el snapshot del heartbeat también lleva `downloaded` y
+# `download_path`, que es lo único que ve el back cuando la GPU está detrás de
+# NAT: sin esto el panel admin no podía mostrar la ruta en equipos emparejados.
+BRIDGE_VERSION = "0.2.8"
