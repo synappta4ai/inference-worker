@@ -1,5 +1,6 @@
 """Tests del servidor HTTP de artefactos (despliegues divididos)."""
 
+import json
 import os
 import threading
 import time
@@ -23,7 +24,15 @@ def httpd(tmp_path, monkeypatch):
 
 
 def _get(url: str, token: str | None = None):
-    req = urllib.request.Request(url)
+    return _call("GET", url, token)
+
+
+def _delete(url: str, token: str | None = None):
+    return _call("DELETE", url, token)
+
+
+def _call(method: str, url: str, token: str | None = None):
+    req = urllib.request.Request(url, method=method)
     if token:
         req.add_header("X-Artifact-Token", token)
     try:
@@ -76,6 +85,73 @@ def test_rejects_hidden_and_dirs(httpd):
     _, base = httpd
     assert _get(f"{base}/artifacts/.token")[0] == 400
     assert _get(f"{base}/artifacts/missing.png")[0] == 404
+
+
+def test_lists_artifacts_with_size(httpd, tmp_path):
+    """El back proxya este listado al panel: nombre + tamaño, sin ocultos."""
+    _, base = httpd
+    (tmp_path / "job_b.png").write_bytes(b"1234")
+    (tmp_path / "job_a.mp4").write_bytes(b"123456")
+    (tmp_path / ".token").write_bytes(b"x")
+    (tmp_path / "sub").mkdir()
+
+    code, _, body = _get(f"{base}/artifacts")
+    assert code == 200
+    payload = json.loads(body)
+    assert payload["count"] == 2
+    assert payload["artifacts"] == [
+        {"name": "job_a.mp4", "size_bytes": 6},
+        {"name": "job_b.png", "size_bytes": 4},
+    ]
+
+
+def test_list_requires_token_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifact_server, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(artifact_server, "ARTIFACT_TOKEN", "s3cr3t")
+    srv = artifact_server.start_server(0)
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.05)
+    try:
+        assert _get(f"{base}/artifacts")[0] == 403
+        assert _get(f"{base}/artifacts", token="s3cr3t")[0] == 200
+    finally:
+        srv.shutdown()
+
+
+def test_delete_removes_artifact(httpd, tmp_path):
+    _, base = httpd
+    path = tmp_path / "job_x.png"
+    path.write_bytes(b"png")
+
+    code, _, body = _delete(f"{base}/artifacts/job_x.png")
+    assert code == 200
+    assert json.loads(body) == {"deleted": "job_x.png", "ok": True}
+    assert not path.exists()
+    # Borrar dos veces: el segundo ya no existe.
+    assert _delete(f"{base}/artifacts/job_x.png")[0] == 404
+
+
+def test_delete_rejects_traversal_and_hidden(httpd):
+    _, base = httpd
+    assert _delete(f"{base}/artifacts/..%2Fserver.py")[0] == 400
+    assert _delete(f"{base}/artifacts/..%5Cserver.py")[0] == 400
+    assert _delete(f"{base}/artifacts/.token")[0] == 400
+
+
+def test_delete_requires_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifact_server, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(artifact_server, "ARTIFACT_TOKEN", "s3cr3t")
+    srv = artifact_server.start_server(0)
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.05)
+    try:
+        (tmp_path / "a.png").write_bytes(b"x")
+        assert _delete(f"{base}/artifacts/a.png")[0] == 403
+        assert _delete(f"{base}/artifacts/a.png", token="s3cr3t")[0] == 200
+    finally:
+        srv.shutdown()
 
 
 def test_safe_name():

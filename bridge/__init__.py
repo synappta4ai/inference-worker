@@ -28,4 +28,8 @@ Piezas:
 # 0.2.8: el snapshot del heartbeat también lleva `downloaded` y
 # `download_path`, que es lo único que ve el back cuando la GPU está detrás de
 # NAT: sin esto el panel admin no podía mostrar la ruta en equipos emparejados.
-BRIDGE_VERSION = "0.2.8"
+#
+# 0.2.9: el artifact server lista (GET /artifacts) y borra
+# (DELETE /artifacts/<nombre>) lo generado, que es lo que proxya el back en
+# /api/v1/worker/artifacts. Antes sólo se podía pedir un archivo por nombre.
+BRIDGE_VERSION = "0.2.9"

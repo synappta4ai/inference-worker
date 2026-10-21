@@ -2,14 +2,12 @@
 
 Este microservicio constituye la **Capa 3** de la arquitectura híbrida de **Brain-Master**. Es un servicio _headless_ (sin interfaz web acoplada) responsable de ejecutar los modelos de difusión de video, generación de imágenes, transcripción de audio y orquestación de LLMs en hardware GPU.
 
-> **Repositorio independiente**, extraído de `brain-master/inference-worker`.
-> Es la pieza que corre a la par del back y del front. Tiene **dos
-> consumidores**: el gateway de brain-master (`backend/`, :8080, usado
-> por el studio legado) y **back-synapta** (:8099, la API de producción), que
+> **Repositorio independiente** y hogar del worker desde que `brain-master`
+> quedó retirado. Es la pieza que corre a la par del back y del front, con
+> **un solo consumidor**: **back-synapta** (:8099, la API de producción), que
 > despacha aquí los modelos `downloaded` por gRPC y re-hospeda los artefactos
 > en `/outputs`. Corre donde haya GPU: tu workstation (costo eléctrico),
-> una GPU dedicada alquilada, o gratis en Colab/Kaggle vía túnel (ver
-> `brain-master/deploy/README.md`).
+> una GPU dedicada alquilada, o gratis en Colab/Kaggle vía túnel.
 
 ## 🏗️ Arquitectura interna (engines)
 
@@ -159,11 +157,9 @@ stateless, `internal/worker`):
   Descargar de /gpu, y generar sin pesos falla con un mensaje claro en vez
   de saturar el PC. `shared` = proveedor en la nube: al arrancar pre-descarga
   todo el catálogo y las generaciones pueden completar pesos al vuelo.
-- Cambios de contrato: editar `proto/inference.proto` (copiado desde
-  `brain-master/proto/`, la fuente histórica) y regenerar TAMBIÉN
-  `back-synapta/internal/worker/proto/` (espejo del código generado).
-  Mientras los dos repos convivan, la fuente canónica sigue en brain-master:
-  sincronizar el `.proto` en ambos sentidos.
+- Cambios de contrato: la fuente canónica es `proto/inference.proto` **de
+  este repo**. Editala acá, regenerá `inference_pb2.py` y espejá el `.proto`
+  más el código Go en `back-synapta/internal/worker/proto/`.
 
 ---
 

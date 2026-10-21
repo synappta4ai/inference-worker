@@ -5,9 +5,15 @@ máquina, el PNG/MP4 generado vive en el disco del worker. Este servidor
 expone BM_OUTPUT_DIR por HTTP para que el gateway pueda servir `artifact_url`
 al front.
 
-  GET /artifacts/<nombre_de_archivo>[?token=...]   → el archivo
+  GET    /artifacts                              → lista de archivos con tamaño
+  GET    /artifacts/<nombre>[?token=...]         → el archivo
+  DELETE /artifacts/<nombre>[?token=...]         → borrar el archivo
   Header alternativo: X-Artifact-Token
-  GET /healthz                                     → {"status":"ok"}
+  GET    /healthz                                → {"status":"ok"}
+
+El listado y el borrado son los que consume el panel admin (el back los
+proxya en /api/v1/worker/artifacts): un worker remoto no tiene otra forma
+de mostrar ni liberar lo que generó.
 
 Solo nombres de archivo (sin rutas): el handler rechaza cualquier path
 con separadores, `..` o prefijo de punto (incluye .token). El token se
@@ -22,6 +28,7 @@ Se puede usar de dos formas:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -53,10 +60,41 @@ class ArtifactHandler(BaseHTTPRequestHandler):
         # HEAD: mismos headers que GET sin el cuerpo (probes del ps1, etc.)
         self._serve(include_body=False)
 
+    def do_DELETE(self) -> None:  # noqa: N802 (API del stdlib)
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/artifacts/"):
+            self._send_json(404, {"error": "not found"})
+            return
+
+        if ARTIFACT_TOKEN and not self._token_ok(parse_qs(parsed.query).get("token", [""])[0]):
+            self._send_json(403, {"error": "token inválido"})
+            return
+
+        name = parsed.path[len("/artifacts/"):]
+        if not name or name == "/":
+            self._send_json(400, {"error": "nombre de archivo requerido"})
+            return
+        if not _safe_name(name):
+            self._send_json(400, {"error": "nombre de archivo inválido"})
+            return
+
+        if not _delete_artifact(name):
+            self._send_json(404, {"error": "artefacto no encontrado"})
+            return
+        self._send_json(200, {"deleted": name, "ok": True})
+
     def _serve(self, include_body: bool) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             self._send_json(200, {"status": "ok"})
+            return
+        if parsed.path == "/artifacts":
+            # Listado para el panel: nombre y tamaño de lo generado.
+            if ARTIFACT_TOKEN and not self._token_ok(parse_qs(parsed.query).get("token", [""])[0]):
+                self._send_json(403, {"error": "token inválido"})
+                return
+            files = _list_artifacts()
+            self._send_json(200, {"artifacts": files, "count": len(files)})
             return
         if not parsed.path.startswith("/artifacts/"):
             self._send_json(404, {"error": "not found"})
@@ -105,7 +143,6 @@ class ArtifactHandler(BaseHTTPRequestHandler):
         return self.headers.get("X-Artifact-Token", "") == ARTIFACT_TOKEN
 
     def _send_json(self, code: int, body: dict) -> None:
-        import json
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -115,6 +152,44 @@ class ArtifactHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:  # silencia el log por request
         logger.debug("artifact: " + fmt, *args)
+
+
+def _list_artifacts() -> list[dict]:
+    """Archivos planos de OUTPUT_DIR con su tamaño (los ocultos no se listan).
+
+    Mismo criterio que el GET por nombre: sólo nombres planos, así que las
+    subcarpetas (y lo que haya adentro) quedan fuera del listado.
+    """
+    out = []
+    base = os.path.abspath(OUTPUT_DIR)
+    if not os.path.isdir(base):
+        return out
+    for name in sorted(os.listdir(base)):
+        path = os.path.join(base, name)
+        if not os.path.isfile(path) or name.startswith("."):
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        out.append({"name": name, "size_bytes": size})
+    return out
+
+
+def _delete_artifact(name: str) -> bool:
+    """Borra un artefacto por nombre plano. True si existía y se borró."""
+    if not _safe_name(name):
+        return False
+    path = os.path.join(os.path.abspath(OUTPUT_DIR), name)
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+        logger.info("Artefacto borrado: %s", name)
+        return True
+    except OSError as exc:
+        logger.warning("No se pudo borrar %s: %s", name, exc)
+        return False
 
 
 def start_server(port: int) -> ThreadingHTTPServer:
