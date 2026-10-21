@@ -1,4 +1,4 @@
-# Dependencias del Worker de Inferencia Brain-Master (imagen GPU)
+# Dependencias del Inference Worker de Synapta (imagen GPU)
 # gRPC
 grpcio==1.84.0
 grpcio-tools==1.84.0

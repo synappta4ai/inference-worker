@@ -1,9 +1,9 @@
-# 🧠 Brain-Master: Worker de Inferencia IA (Python + CUDA)
+# 🧠 Inference Worker: Motor de Inferencia IA (Python + CUDA)
 
-Este microservicio constituye la **Capa 3** de la arquitectura híbrida de **Brain-Master**. Es un servicio _headless_ (sin interfaz web acoplada) responsable de ejecutar los modelos de difusión de video, generación de imágenes, transcripción de audio y orquestación de LLMs en hardware GPU.
+Este microservicio constituye la **Capa 3** de la plataforma **Synapta**. Es un servicio _headless_ (sin interfaz web acoplada) responsable de ejecutar los modelos de difusión de video, generación de imágenes, transcripción de audio y orquestación de LLMs en hardware GPU.
 
-> **Repositorio independiente** y hogar del worker desde que `brain-master`
-> quedó retirado. Es la pieza que corre a la par del back y del front, con
+> **Repositorio independiente**, el único hogar del worker desde que
+> `brain-master` quedó retirado. Es la pieza que corre a la par del back y del front, con
 > **un solo consumidor**: **back-synapta** (:8099, la API de producción), que
 > despacha aquí los modelos `downloaded` por gRPC y re-hospeda los artefactos
 > en `/outputs`. Corre donde haya GPU: tu workstation (costo eléctrico),
@@ -80,7 +80,7 @@ El worker de inferencia requiere hardware especializado con aceleración CUDA. A
 - **Cómo desplegarlo:**
   - Desplegar el worker mediante Docker con soporte para GPU:
     ```bash
-    docker run -d --gpus all -p 50051:50051 -v /models:/app/models brain-master-worker:latest
+    docker run -d --gpus all -p 50051:50051 -v /models:/app/models inference-worker:latest
     ```
   - Conectar de forma segura con el Gateway de Go utilizando una VPN privada como **Tailscale** o **WireGuard**.
 
@@ -132,7 +132,7 @@ python server.py
 
 ```text
 2026-09-19 00:00:00 [INFO] [InferenceEngine] Inicializado motor de IA.
-🧠 [Brain-Master] Worker de Inferencia Python listo.
+🧠 [Inference Worker] Worker de Inferencia Python listo.
 Telemetría: {'device_name': 'NVIDIA GeForce RTX 4090', 'total_vram_mb': 24564, 'free_vram_mb': 23100, ...}
 ```
 

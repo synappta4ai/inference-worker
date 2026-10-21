@@ -298,14 +298,14 @@ async def serve() -> None:
 
     if provider_shared():
         launched = predownload_all(servicer.ops)
-        logger.info("[Brain-Master] modo proveedor compartido: %d descarga(s) lanzada(s)",
+        logger.info("[Inference Worker] modo proveedor compartido: %d descarga(s) lanzada(s)",
                     len(launched))
 
     server = aio.server()
     inference_pb2_grpc.add_InferenceServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
     await server.start()
-    logger.info("🧠 [Brain-Master] Worker de inferencia gRPC escuchando en :%s", port)
+    logger.info("🧠 [Inference Worker] Worker de inferencia gRPC escuchando en :%s", port)
     try:
         await server.wait_for_termination()
     except KeyboardInterrupt:

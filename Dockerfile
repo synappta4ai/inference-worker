@@ -1,8 +1,8 @@
 # =============================================================================
-# Worker de Inferencia Brain-Master — imagen GPU desplegable
+# Inference Worker de Synapta — imagen GPU desplegable
 #
 # Build (en máquina con GPU o para registry):
-#   docker build -t brainmaster-worker:latest .
+#   docker build -t inference-worker:latest .
 #
 # Run local (NVIDIA Container Toolkit requerido):
 #   docker run -d --gpus all \
@@ -10,7 +10,7 @@
 #     -e BM_OUTPUT_DIR=/app/outputs \
 #     -v /ruta/cache/hf:/root/.cache/huggingface \
 #     -v /ruta/app/models:/models:ro \        # opcional: familias bridge V1
-#     -p 50051:50051 brainmaster-worker:latest
+#     -p 50051:50051 inference-worker:latest
 #
 # Plataformas: Runpod · Vast.ai · Lambda · Fly.io (GPU) · EC2 g5/g6 · local
 # =============================================================================
