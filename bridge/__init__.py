@@ -20,4 +20,8 @@ Piezas:
 # pesos volvían a fallar con "Permission denied" y no arrancaban nunca) y la
 # cancelación de descargas (corta también el camino Xet y descarta los restos
 # a medio bajar, que inflaban el tamaño/porcentaje que ve el panel).
-BRIDGE_VERSION = "0.2.6"
+#
+# 0.2.7: el catálogo (ListModels) reporta la ruta de los pesos en disco
+# (download_path), así el back y el panel ubican los archivos sin adivinar el
+# slug de la caché. Un worker 0.2.6 sigue funcionando: sólo omite el campo.
+BRIDGE_VERSION = "0.2.7"

@@ -497,6 +497,9 @@ class TestServerModelRPCs:
         assert resp.models[0].downloaded is True
         assert resp.models[0].download_percent == 100.0
         assert resp.models[0].size_bytes == 120
+        # La ruta de caché permite ubicar los pesos sin adivinar el slug.
+        assert resp.models[0].download_path.endswith("models--org--demo")
+        assert resp.models[1].download_path.endswith("models--org--bridge")
         assert resp.models[1].available is False
 
     async def test_download_cancel_and_delete_map_state(self, servicer, monkeypatch):

@@ -30,7 +30,7 @@ import inference_pb2_grpc
 from vram_manager import VRAMManager
 from engines.base import EngineContext, resolve
 from engines import registry
-from model_ops import ModelOps
+from model_ops import ModelOps, repo_cache_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("BrainMasterInferenceWorker")
@@ -166,6 +166,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
                 download_percent=float(state.progress),
                 size_bytes=int(state.size_bytes),
                 download_error=state.error,
+                download_path=repo_cache_dir(m.get("repo")) or "",
             )
             resp.models.append(info)
         logger.info("[ListModels] %d modelos | device=%s", len(resp.models), tel["device_name"])
