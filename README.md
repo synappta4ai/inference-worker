@@ -159,7 +159,22 @@ stateless, `internal/worker`):
   todo el catálogo y las generaciones pueden completar pesos al vuelo.
 - Cambios de contrato: la fuente canónica es `proto/inference.proto` **de
   este repo**. Editala acá, regenerá `inference_pb2.py` y espejá el `.proto`
-  más el código Go en `back-synapta/internal/worker/proto/`.
+  más el código Go en `back-synapta/internal/worker/proto/`:
+
+  ```bash
+  # Python stubs (desde la raíz del repo)
+  py -3 -m grpc_tools.protoc -Iproto --python_out=. --grpc_python_out=. proto/inference.proto
+
+  # Go stubs del back (protoc-gen-go + protoc-gen-go-grpc en el PATH)
+  py -3 -m grpc_tools.protoc -Iproto \
+    --go_out=../back-synapta/internal/worker/proto --go_opt=paths=source_relative \
+    --go-grpc_out=../back-synapta/internal/worker/proto --go-grpc_opt=paths=source_relative \
+    proto/inference.proto
+  ```
+
+  El `option go_package` apunta a `synapta/internal/worker/proto;inferencev1`
+  (el path real del espejo en el back), y los dos `.proto` deben quedar
+  byte-idénticos.
 
 ---
 

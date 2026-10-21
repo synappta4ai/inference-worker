@@ -2,7 +2,8 @@ syntax = "proto3";
 
 package maestro.inference.v1;
 
-option go_package = "brain-master/backend/proto/inference/v1;inferencev1";
+// The Go side is mirrored into back-synapta as internal/worker/proto.
+option go_package = "synapta/internal/worker/proto;inferencev1";
 
 service InferenceService {
   // Streaming de progreso de generación de video/imagen
