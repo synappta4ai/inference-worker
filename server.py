@@ -284,12 +284,6 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
 async def serve() -> None:
     port = int(os.environ.get("GRPC_PORT", "50051"))
 
-    # Servidor de artefactos HTTP (despliegues divididos: worker en la nube,
-    # gateway en otra máquina). BM_ARTIFACT_PORT=0 lo desactiva.
-    if os.environ.get("BM_ARTIFACT_PORT", "50052") != "0":
-        from artifact_server import start_background
-        start_background(int(os.environ.get("BM_ARTIFACT_PORT", "50052")))
-
     servicer = InferenceServicer()
     # Proveedor compartido en la nube (BM_PROVIDER_MODE=shared): pre-descarga
     # todo el catálogo al arrancar para servir sin esperas. En modo personal
@@ -300,6 +294,14 @@ async def serve() -> None:
         launched = predownload_all(servicer.ops)
         logger.info("[Inference Worker] modo proveedor compartido: %d descarga(s) lanzada(s)",
                     len(launched))
+
+    # Servidor de artefactos HTTP (despliegues divididos: worker en la nube,
+    # gateway en otra máquina). BM_ARTIFACT_PORT=0 lo desactiva. Le pasamos
+    # el ModelOps del gRPC para que HTTP y gRPC compartan el estado de
+    # descarga de pesos en tiempo real.
+    if os.environ.get("BM_ARTIFACT_PORT", "50052") != "0":
+        from artifact_server import start_background
+        start_background(int(os.environ.get("BM_ARTIFACT_PORT", "50052")), servicer.ops)
 
     server = aio.server()
     inference_pb2_grpc.add_InferenceServiceServicer_to_server(servicer, server)
