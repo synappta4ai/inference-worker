@@ -439,9 +439,12 @@ class InstallerApp(tk.Tk):
         self._run_bg(job, ok)
 
     def refresh_logs(self) -> None:
-        """Volca el tail del worker.log en la pantalla Listo (sin PowerShell)."""
+        """Volca la actividad reciente en la pantalla Listo (sin PowerShell).
+
+        Vista filtrada sin ruido de sondeo; el diagnóstico crudo completo
+        sigue disponible con «Copiar diagnóstico» (worker_log_tail)."""
         try:
-            text = core.worker_log_tail(self.workdir)
+            text = core.worker_log_activity(self.workdir)
         except Exception as exc:  # noqa: BLE001 — mostrar, no romper
             text = f"no pude leer los logs: {exc}"
         self.done_log.configure(state="normal")

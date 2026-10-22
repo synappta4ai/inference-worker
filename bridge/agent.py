@@ -310,7 +310,15 @@ class Agent:
         journal.record(entry)
         try:
             last_report = 0.0
+            # Hitos locales para ver el avance en worker.log sin espiar el
+            # stream: 3 líneas por job en vez de cientos de eventos.
+            milestones = [25.0, 50.0, 75.0]
             for event in stub.GenerateMedia(req, timeout=6 * 3600):
+                pct = float(event.percentage or 0.0)
+                while milestones and pct >= milestones[0]:
+                    done = milestones.pop(0)
+                    logger.info("[bridge] job %s: %d%% (%s)",
+                                job.task_id, int(done), event.status)
                 # Reporto como mucho 1 vez/2 s: el back solo dibuja una barra.
                 if event.status in ("GENERATING",) and time.time() - last_report < 2.0:
                     continue

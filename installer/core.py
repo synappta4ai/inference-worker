@@ -838,6 +838,73 @@ def worker_log_tail(workdir: Optional[Path] = None, lines: int = 25) -> str:
     return f"{head}\n{tail}{hint}"
 
 
+# Líneas de sondeo rutinario que tapan la actividad real en la vista de
+# eventos: catálogo/telemetría que el agente y el back consultan cada ~20 s.
+# (Desde que ListModels/GetModelState loguean a DEBUG ya no deberían
+# aparecer, pero los worker.log viejos siguen llenos de ellas.)
+_NOISE_PREFIXES = ("[ListModels]", "[GetModelState]")
+
+
+def _is_noise(line: str) -> bool:
+    """True si la línea no dice nada sobre lo que está haciendo el worker."""
+    s = line.strip()
+    if not s:
+        return True
+    # Fragmento huérfano del nombre del dispositivo (versiones viejas lo
+    # dejaban suelto entre líneas): el estado ya muestra back y worker.
+    if s.startswith("device="):
+        return True
+    return any(tag in s for tag in _NOISE_PREFIXES)
+
+
+def _collapse_repeats(lines: list) -> list:
+    """Colapsa rachas idénticas: ['a', 'a', 'a', 'b'] → ['a (×3)', 'b']."""
+    out: list = []
+    prev: Optional[str] = None
+    count = 0
+    for line in lines:
+        if line == prev:
+            count += 1
+            continue
+        if prev is not None:
+            out.append(f"{prev} (×{count})" if count > 1 else prev)
+        prev, count = line, 1
+    if prev is not None:
+        out.append(f"{prev} (×{count})" if count > 1 else prev)
+    return out
+
+
+def worker_log_activity(workdir: Optional[Path] = None, scan: int = 300,
+                        keep: int = 25) -> str:
+    """Actividad reciente legible para la pantalla «Listo» (sin terminal).
+
+    Lee las últimas `scan` líneas del worker.log, quita el ruido de sondeo
+    y colapsa repeticiones: lo que queda son jobs reclamados/avances/
+    entregas, descargas de pesos, errores y actividad del agente. El
+    diagnóstico completo y crudo sigue en worker_log_tail (botón Copiar).
+    """
+    wd = log_dir(workdir)
+    _, back_url, worker_id = _pairing()
+    head = f"back: {back_url or '(sin emparejar)'}"
+    if worker_id:
+        head += f" · worker {worker_id[:8]}…"
+    try:
+        content = (wd / "worker.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return f"{head}\n(sin log)"
+    meaningful = [ln for ln in content.splitlines()[-scan:] if not _is_noise(ln)]
+    shown = _collapse_repeats(meaningful)[-keep:]
+    if not shown:
+        shown = ["(sin actividad reciente: el worker está en espera)"]
+    body = "\n".join(shown)
+    # Misma pista que el tail crudo: la causa más común sigue siendo la URL.
+    if "WinError 10061" in body or "connection refused" in body.lower():
+        body += ("\n\nPISTA: «conexión denegada» = el back no escucha en esa URL. "
+                 "Si dice localhost:8099, re-emparejá contra "
+                 "https://back-dev.synappta.cloud con un código nuevo.")
+    return f"{head}\n{body}"
+
+
 def _tail(path: Path, lines: int = 12) -> str:
     try:
         content = path.read_text(encoding="utf-8", errors="replace")

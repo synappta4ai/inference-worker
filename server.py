@@ -169,7 +169,9 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
                 download_path=repo_cache_dir(m.get("repo")) or "",
             )
             resp.models.append(info)
-        logger.info("[ListModels] %d modelos | device=%s", len(resp.models), tel["device_name"])
+        # Lectura rutinaria (heartbeat del agente ~20 s + lookups del back):
+        # a DEBUG para no tapar la actividad real en Últimos eventos.
+        logger.debug("[ListModels] %d modelos | device=%s", len(resp.models), tel["device_name"])
         return resp
 
     # ------------------------------------------------------------------
@@ -228,7 +230,8 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         )
         for state in states:
             resp.states.append(self._operation_response(state))
-        logger.info("[GetModelState] key=%s estados=%d", key or "todos", len(resp.states))
+        # Como ListModels: lectura de sondeo, no actividad.
+        logger.debug("[GetModelState] key=%s estados=%d", key or "todos", len(resp.states))
         return resp
 
     # ------------------------------------------------------------------
