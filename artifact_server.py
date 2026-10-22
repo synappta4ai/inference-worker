@@ -38,8 +38,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from model_ops import ModelOps, repo_cache_dir
@@ -48,6 +51,8 @@ logger = logging.getLogger("ArtifactServer")
 
 OUTPUT_DIR = os.environ.get("BM_OUTPUT_DIR", "outputs")
 ARTIFACT_TOKEN = os.environ.get("BM_ARTIFACT_TOKEN", "")
+
+ROOT = Path(__file__).resolve().parent
 
 # ModelOps compartido con el servidor gRPC (se setea desde server.py). Si
 # nadie lo setea (modo standalone), cada lectura crea uno nuevo: los estados
@@ -139,6 +144,9 @@ class ArtifactHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (API del stdlib)
         parsed = urlparse(self.path)
+        if parsed.path == "/worker/update":
+            self._handle_update(parsed)
+            return
         if not parsed.path.startswith("/models/"):
             self._send_json(404, {"error": "not found"})
             return
@@ -215,6 +223,50 @@ class ArtifactHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "artefacto no encontrado"})
             return
         self._send_json(200, {"deleted": name, "ok": True})
+
+    def _handle_update(self, parsed) -> None:
+        """POST /worker/update — auto-update del worker.
+
+        Body JSON: { "url": "<url_del_zip_nuevo>", "sha256": "<hex_opcional>" }
+        Se ejecuta como subproceso desacoplado: responde inmediato y el
+        subproceso detiene, reemplaza y relanza el worker.
+        """
+        if not self._token_ok_req(parsed):
+            self._send_json(403, {"error": "token inválido"})
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._send_json(400, {"error": "body JSON requerido"})
+            return
+        url = str(data.get("url", "")).strip()
+        if not url:
+            self._send_json(400, {"error": "url es requerido"})
+            return
+        sha256 = str(data.get("sha256", "")).strip()
+        script = ROOT / "scripts" / "update_worker.py"
+        cmd = [sys.executable, str(script), "--url", url]
+        if sha256:
+            cmd += ["--sha256", sha256]
+        kwargs: dict = dict(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except Exception as exc:
+            self._send_json(500, {"error": f"no se pudo programar el update: {exc}"})
+            return
+        self._send_json(200, {"status": "scheduled", "url": url})
 
     def _serve(self, include_body: bool) -> None:
         parsed = urlparse(self.path)
