@@ -5,7 +5,7 @@ Worker de inferencia (gRPC + artifact server). Python (PyTorch/Diffusers) + gRPC
 ## Reglas del repo
 
 - Cada subcarpeta puede tener su propio `AGENTS.md`; leé el de la carpeta en la que vas a trabajar.
-- Repos separados: `front-synapta`, `back-synapta` e `inference-worker` tienen su propio git; los commits se hacen por repo.
+- Repos separados: `front-synappta`, `back-synappta` e `inference-worker` tienen su propio git; los commits se hacen por repo.
 - Nunca commitear: `.env`, `.env.e2e`, logs (`*.log`), IPs públicas o secretos.
 
 ## Commits
@@ -16,14 +16,14 @@ Worker de inferencia (gRPC + artifact server). Python (PyTorch/Diffusers) + gRPC
 ## Verificación antes de cerrar
 
 - `python3 -m py_compile` en los `.py` que tocaste.
-- `go build ./...` + `go vet ./...` solo si tocás código en `back-synapta` (otro repo).
+- `go build ./...` + `go vet ./...` solo si tocás código en `back-synappta` (otro repo).
 
 ## Cómo se conecta
 
 - `BM_WORKER_ADDR` (`host:port`, o `tls://host:port`) para que el back se conecte al gRPC `:50051`.
 - `BM_WORKER_ARTIFACT_BASE` para re-hospedar artefactos del worker remoto (artifact server `:50052`).
 - `BM_ARTIFACT_TOKEN` para proteger los endpoints HTTP del artifact server (modelos, artefactos, auto-update).
-- Contrato gRPC: `proto/inference.proto` es la fuente; el back espeja el código generado en `back-synapta/internal/worker/proto/`. Si cambiás el contrato, regenerá ambos lados.
+- Contrato gRPC: `proto/inference.proto` es la fuente; el back espeja el código generado en `back-synappta/internal/worker/proto/`. Si cambiás el contrato, regenerá ambos lados.
 
 ## Estado
 
