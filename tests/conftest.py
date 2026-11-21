@@ -18,6 +18,19 @@ if WORKER_DIR not in sys.path:
 
 
 @pytest.fixture(autouse=True)
+def _no_remote_metadata(monkeypatch):
+    """Ningún test consulta Hugging Face por el tamaño del repo.
+
+    `_download` pide el total remoto para que el porcentaje sea exacto; en
+    tests eso sería una llamada de red lenta y no determinista. Los tests que
+    la necesitan la reemplazan por su propio valor.
+    """
+    import model_ops
+
+    monkeypatch.setattr(model_ops, "remote_total_bytes", lambda repo: 0)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_output_dir(tmp_path, monkeypatch):
     """Redirige los outputs del worker a un directorio temporal por test."""
     out = tmp_path / "outputs"

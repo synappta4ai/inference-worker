@@ -50,8 +50,11 @@ async def test_full_stream_over_real_grpc(grpc_env):
     assert os.path.isfile(os.path.join(server_mod.OUTPUT_DIR, "int1.png"))
 
 
-async def test_enhance_and_telemetry_over_grpc(grpc_env):
+async def test_enhance_and_telemetry_over_grpc(grpc_env, monkeypatch):
     _, stub = grpc_env
+    # El servidor corre en este proceso: se fija "sin CUDA" para no depender
+    # de si la máquina de turno tiene GPU.
+    monkeypatch.setattr("vram_manager.HAS_TORCH", False)
 
     enh = await stub.EnhancePrompt(
         inference_pb2.PromptEnhanceRequest(

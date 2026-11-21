@@ -8,10 +8,16 @@ el artefacto en `out_dir`. La cancelación es cooperativa vía asyncio.Event.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, Protocol
 
 from inference_pb2 import MediaGenerationRequest  # type: ignore[import-not-found]
+
+logger = logging.getLogger("ModelCatalog")
 
 
 @dataclass
@@ -60,10 +66,14 @@ class Engine(Protocol):
 
 
 # ----------------------------------------------------------------------
-# Catálogo de modelos (claves = request.model_name del gateway)
+# Catálogo embebido de modelos (claves = request.model_name del gateway)
+#
+# Fallback de `load_catalog()`: se usa sólo si model_catalog.yaml falta, no
+# se puede parsear o no tiene entradas válidas. Mantener ambos lados en
+# sync: tests/test_catalog_yaml.py compara campo por campo.
 # ----------------------------------------------------------------------
 
-MODEL_CATALOG: dict[str, ModelSpec] = {
+BUILTIN_CATALOG: dict[str, ModelSpec] = {
     # ==================================================================
     # IMAGEN — factoría genérica diffusers (pesos públicos de HF)
     # ==================================================================
@@ -253,6 +263,113 @@ MODEL_CATALOG: dict[str, ModelSpec] = {
         mode="audio", pipeline="yue2", vram_gb=24, family="music",
     ),
 }
+
+
+# ----------------------------------------------------------------------
+# Catálogo en runtime: model_catalog.yaml con fallback al dict embebido
+# ----------------------------------------------------------------------
+
+CATALOG_FILENAME = "model_catalog.yaml"
+# Ruta explícita (despliegues con el catálogo fuera del repo).
+CATALOG_ENV = "BM_MODEL_CATALOG"
+
+# Campos declarativos del YAML. `null` / ausente = default del ModelSpec.
+_SPEC_FIELDS = (
+    "label", "engine", "repo", "mode", "pipeline", "dtype", "steps",
+    "guidance_scale", "max_side", "vram_gb", "family", "notes",
+)
+_ENGINES = ("diffusers", "v1_bridge", "mock")
+
+
+def catalog_candidates() -> list[Path]:
+    """Rutas donde buscar el catálogo, en orden de prioridad."""
+    root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    explicit = os.environ.get(CATALOG_ENV, "").strip()
+    if explicit:
+        candidates.append(Path(explicit))
+    meipass = getattr(sys, "_MEIPASS", None)  # worker congelado (instalador)
+    if meipass:
+        candidates.append(Path(meipass) / CATALOG_FILENAME)
+    candidates.append(root / CATALOG_FILENAME)
+    return candidates
+
+
+def _spec_from_entry(key: str, raw: object) -> ModelSpec:
+    """Valida una entrada del YAML y la convierte en ModelSpec."""
+    if not isinstance(raw, dict):
+        raise ValueError("la entrada debe ser un mapa de campos")
+    if raw.get("key") is not None and str(raw["key"]) != key:
+        logger.warning(
+            "[Catalog] '%s' declara key='%s': manda la clave del mapa",
+            key, raw["key"],
+        )
+    kwargs = {f: raw[f] for f in _SPEC_FIELDS if raw.get(f) is not None}
+    # repo es posicional obligatorio en ModelSpec: los mock no tienen pesos.
+    kwargs.setdefault("repo", None)
+    engine = str(kwargs.get("engine", ""))
+    if engine not in _ENGINES:
+        raise ValueError(f"engine inválido: {engine!r} (esperado {_ENGINES})")
+    if not kwargs.get("pipeline"):
+        raise ValueError("falta pipeline")
+    if not kwargs.get("family"):
+        raise ValueError("falta family")
+    if engine != "mock" and not kwargs.get("repo"):
+        raise ValueError("falta repo (obligatorio salvo engine=mock)")
+    return ModelSpec(key=key, **kwargs)
+
+
+def load_catalog(path: Path | None = None) -> dict[str, ModelSpec]:
+    """Lee el catálogo del YAML; si no se puede, usa BUILTIN_CATALOG.
+
+    Nunca lanza: un YAML roto (o la falta de PyYAML) no puede dejar al worker
+    sin catálogo.
+    """
+    try:
+        import yaml  # tardío: sin PyYAML el worker arranca con el embebido
+    except ImportError:
+        logger.warning(
+            "[Catalog] PyYAML no instalado: uso el catálogo embebido (%d modelos)",
+            len(BUILTIN_CATALOG),
+        )
+        return dict(BUILTIN_CATALOG)
+
+    candidates = [Path(path)] if path is not None else catalog_candidates()
+    source = next((p for p in candidates if p.is_file()), None)
+    if source is None:
+        logger.warning(
+            "[Catalog] no se encontró %s (buscado en %s): uso el catálogo embebido",
+            CATALOG_FILENAME, ", ".join(str(p) for p in candidates),
+        )
+        return dict(BUILTIN_CATALOG)
+
+    try:
+        raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.error("[Catalog] %s ilegible (%s): uso el catálogo embebido", source, exc)
+        return dict(BUILTIN_CATALOG)
+
+    models = raw.get("models") if isinstance(raw, dict) else None
+    if not isinstance(models, dict) or not models:
+        logger.error("[Catalog] %s sin un mapa 'models': uso el catálogo embebido", source)
+        return dict(BUILTIN_CATALOG)
+
+    catalog: dict[str, ModelSpec] = {}
+    for entry_key, entry in models.items():
+        try:
+            catalog[str(entry_key)] = _spec_from_entry(str(entry_key), entry)
+        except (TypeError, ValueError) as exc:
+            # Una entrada mala no invalida el resto del catálogo.
+            logger.error("[Catalog] entrada '%s' inválida en %s: %s", entry_key, source, exc)
+    if not catalog:
+        logger.error("[Catalog] sin entradas válidas en %s: uso el catálogo embebido", source)
+        return dict(BUILTIN_CATALOG)
+
+    logger.info("[Catalog] %d modelos cargados desde %s", len(catalog), source)
+    return catalog
+
+
+MODEL_CATALOG: dict[str, ModelSpec] = load_catalog()
 
 
 def resolve(model_name: str, mode: str) -> ModelSpec:

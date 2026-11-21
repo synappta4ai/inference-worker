@@ -273,6 +273,15 @@ class ArtifactHandler(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             self._send_json(200, {"status": "ok"})
             return
+        if parsed.path == "/artifacts":
+            # Listado plano de OUTPUTS_DIR (sin ocultos ni subcarpetas): el back
+            # lo proxya al panel de admin del worker.
+            if not self._token_ok_req(parsed):
+                self._send_json(403, {"error": "token inválido"})
+                return
+            artifacts = _list_artifacts()
+            self._send_json(200, {"artifacts": artifacts, "count": len(artifacts)})
+            return
         if parsed.path == "/models":
             if not self._token_ok_req(parsed):
                 self._send_json(403, {"error": "token inválido"})

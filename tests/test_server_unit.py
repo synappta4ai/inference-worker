@@ -229,11 +229,14 @@ class TestEnhancePrompt:
 
 class TestGetGpuTelemetry:
 
-    async def test_telemetry_without_cuda(self, servicer):
+    async def test_telemetry_without_cuda(self, servicer, monkeypatch):
+        # "Sin CUDA" se fija a propósito: la máquina de desarrollo ya tiene
+        # GPU (RTX 5070) y el test dependía de que no la hubiera.
+        monkeypatch.setattr("vram_manager.HAS_TORCH", False)
         resp = await servicer.GetGpuTelemetry(
             inference_pb2.GpuTelemetryRequest(), None
         )
-        # En el entorno de CI/test no hay GPU: el mock reporta CPU.
+        # Sin torch/CUDA el telemetrista reporta CPU.
         assert resp.device_name == "CPU / No CUDA"
         assert resp.total_vram_mb == 0
 
@@ -251,3 +254,6 @@ class TestOutputPath:
         assert _output_path("j", "video") == "j.mp4"
         assert _output_path("j", "") == "j.mp4"
         assert _output_path("j", "IMAGE") == "j.png"
+        assert _output_path("j", "tts") == "j.wav"
+        assert _output_path("j", "audio") == "j.wav"
+        assert _output_path("j", "AUDIO") == "j.wav"

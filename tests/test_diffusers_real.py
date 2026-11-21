@@ -12,7 +12,7 @@ import os
 import inference_pb2
 import pytest
 
-from engines import diffusers_engine
+from engines import diffusion_factory
 from engines.base import EngineContext, MODEL_CATALOG
 
 pytestmark = pytest.mark.skipif(
@@ -30,7 +30,7 @@ async def test_real_diffusion_pipeline(tmp_path):
     ctx = EngineContext(out_dir=str(tmp_path), cancel=asyncio.Event())
 
     events = []
-    async for evt in diffusers_engine.generate(req, spec, ctx):
+    async for evt in diffusion_factory.generate(req, spec, ctx):
         events.append(evt)
 
     statuses = [e[1] for e in events]
@@ -61,7 +61,7 @@ async def test_real_pipeline_respects_cancellation(tmp_path):
 
     task = asyncio.ensure_future(cancel_soon())
     events = []
-    async for evt in diffusers_engine.generate(req, spec, ctx):
+    async for evt in diffusion_factory.generate(req, spec, ctx):
         events.append(evt)
     await task
 

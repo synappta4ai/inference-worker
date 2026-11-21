@@ -113,6 +113,50 @@ class TestInspectRepo:
         assert state.size_bytes == 4
         assert state.progress == pytest.approx(100.0 * 4 / 36)
 
+    def test_no_tree_counts_blobs_once(self, tmp_path, monkeypatch):
+        """Caché sin `trees/*.json`: el peso sale de blobs, no duplicado."""
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        # El snapshot es un enlace/copia del blob: mismo contenido, dos rutas.
+        write_cache_file(cache, "models--org--demo", "blobs", "abc",
+                         content=b"x" * 40)
+        write_cache_file(cache, "models--org--demo", "snapshots", "rev",
+                         "model.safetensors", content=b"x" * 40)
+
+        state = model_ops.ModelOps().snapshot("demo")
+
+        assert state.downloaded is True
+        assert state.size_bytes == 40
+
+    def test_progress_uses_remote_total_without_local_tree(self, tmp_path, monkeypatch):
+        """Sin árbol local el porcentaje igual avanza: total de Hugging Face."""
+        cache = use_demo_cache(tmp_path, monkeypatch)
+        monkeypatch.setattr(model_ops, "remote_total_bytes", lambda repo: 100)
+        stop = threading.Event()
+
+        def alive(repo, tqdm_class=None, max_workers=None):
+            write_cache_file(cache, "models--org--demo", "blobs", "abc",
+                             content=b"x" * 25)
+            write_cache_file(cache, "models--org--demo", "snapshots", "rev",
+                             "model.safetensors", content=b"x" * 25)
+            stop.wait(5)
+
+        monkeypatch.setattr(model_ops, "snapshot_download", alive)
+        ops = model_ops.ModelOps()
+        ops.start_download("demo")
+        blobs = cache / "models--org--demo" / "blobs"
+        assert wait_for(lambda: list(blobs.glob("abc")))
+
+        try:
+            state = ops.snapshot("demo")
+
+            assert state.downloading is True
+            # Peso y porcentaje hablan del mismo total: 25 de 100 bytes.
+            assert state.size_bytes == 25
+            assert state.progress == pytest.approx(25.0)
+        finally:
+            stop.set()
+            assert wait_for(lambda: not ops._running(ops._ops["demo"]))
+
     def test_unknown_key_raises(self, tmp_path, monkeypatch):
         use_demo_cache(tmp_path, monkeypatch)
         with pytest.raises(KeyError):

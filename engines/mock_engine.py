@@ -9,28 +9,50 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 
 from .base import EngineContext, ModelSpec
 
+# Modo → extensión del artefacto. `tts`/`audio` producen WAV: con el "mp4 el
+# resto" anterior completaban con un archivo que decía ser video.
+_EXT_BY_MODE = {"image": "png", "tts": "wav", "audio": "wav"}
+
+_PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082"
+)
+
 
 def _output_path(job_id: str, mode: str) -> str:
-    ext = "png" if (mode or "").lower() == "image" else "mp4"
-    return f"{job_id}.{ext}"
+    """Artefacto por modo: png (imagen), wav (tts/audio), mp4 el resto."""
+    return f"{job_id}.{_EXT_BY_MODE.get((mode or '').lower(), 'mp4')}"
+
+
+def _silent_wav(samples: int = 800, rate: int = 8000) -> bytes:
+    """WAV PCM 16-bit mono en silencio (0,1 s): archivo válido, no un renombre."""
+    data = b"\x00\x00" * samples
+    header = (
+        b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+        + b"data" + struct.pack("<I", len(data))
+    )
+    return header + data
 
 
 def _write_output(path: str, req) -> None:
-    """Artefacto determinista válido (placeholder del encoder final)."""
+    """Artefacto determinista válido (placeholder del encoder final).
+
+    El contenido sale de la extensión que fijó `_output_path`, así el mapa
+    modo → artefacto vive en un solo lugar.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    is_image = (req.mode or "").lower() == "image"
-    if is_image:
-        payload = bytes.fromhex(
-            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-            "0000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082"
-        )
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        payload = _PNG_1PX
+    elif ext == ".wav":
+        payload = _silent_wav()
     else:
-        payload = (
-            f"BM_MOCK_VIDEO job={req.job_id} frames={req.num_frames}\n"
-        ).encode()
+        payload = f"BM_MOCK_VIDEO job={req.job_id} frames={req.num_frames}\n".encode()
     with open(path, "wb") as fh:
         fh.write(payload)
 

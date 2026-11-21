@@ -9,16 +9,24 @@ diffusers>=0.36.0
 transformers>=4.57.0
 tokenizers>=0.22.0
 accelerate>=1.12.0
-bitsandbytes>=0.45.0 ; platform_system == "Linux" and platform_machine == "x86_64"
+# 4-bit del text encoder de Wan en GPU: wheels oficiales de Windows y Linux.
+bitsandbytes>=0.45.0 ; (platform_system == "Linux" and platform_machine == "x86_64") or platform_system == "Windows"
 safetensors
 sentencepiece
 einops
 open_clip_torch
 
 # Media (encoder MP4 del motor de video)
+# Video: escritura MP4 (imageio) y limpieza de prompt que diffusers importa
+# dentro de sus pipelines de video (Wan/CogVideoX: `ftfy`).
+ftfy>=6.1
 imageio>=2.37.0
 imageio-ffmpeg>=0.6.0
 Pillow
+
+# Catálogo de modelos en YAML (model_catalog.yaml). Sin PyYAML el worker
+# arranca igual, con el catálogo embebido de engines/base.py.
+PyYAML>=6.0.2
 
 # Operación
 psutil

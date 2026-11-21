@@ -15,22 +15,48 @@ Este microservicio constituye la **Capa 3** de la plataforma **Synapta**. Es un 
 server.py (gRPC :50051) ──► engines/registry.py ──► engine según MODEL_CATALOG
                                    │                    ├── mock            (sin pesos, determinista)
                                    │                    ├── diffusion_factory (genérico Diffusers, default)
-                                   │                    ├── v1_bridge        (código V1 legado)
-                                   │                    └── diffusers_engine (monolítico, deprecado)
+                                   │                    └── v1_bridge        (código V1 legado)
 artifact_server.py (:50052) ── publica los archivos generados (workers remotos)
 vram_manager.py ─────────────── telemetría VRAM + torch.cuda.empty_cache()
+engines/worker_host.py ─────── hijo aislado: carga los pesos y genera (un
+                               OOM ahí no tumba al worker)
 ```
 
-- **Fuente única de modelos**: `engines/base.py` → `MODEL_CATALOG` (spec
-  declarativa: repo HF, steps, guidance, dtype, VRAM estimada). `ListModels`
-  y el catálogo de back-synapta salen de acá — **agregar un modelo = agregar
-  una entrada** (más el pipeline en la factoría si no existe).
+- **Fuente única de modelos**: `model_catalog.yaml` (spec declarativa: repo
+  HF, steps, guidance, dtype, VRAM estimada), leído al arrancar por
+  `engines/base.py → load_catalog()`. Si el archivo falta, no se puede
+  parsear o no tiene entradas válidas, cae a `BUILTIN_CATALOG` (el mismo
+  dict, embebido). `BM_MODEL_CATALOG` apunta a otra ruta. `ListModels` y el
+  catálogo de back-synapta salen de acá — **agregar un modelo = agregar una
+  entrada** (más el pipeline en la factoría si no existe), sin tocar código.
 - **Flujo de un job**: `GenerateMedia` emite
   `LOADING_MODEL → GENERATING* → POSTPROCESSING → COMPLETED/FAILED` con
   cancelación cooperativa (`asyncio.Event`) y escribe el artefacto en
   `BM_OUTPUT_DIR` (default `outputs/` dentro del repo, ya en `.gitignore`).
-- **Interruptores**: `BM_FORCE_MOCK=1` (fuerza mock, tests/diagnóstico),
-  `BM_USE_DIFFUSERS_ENGINE=1` (motor legado).
+- **Interruptores**: `BM_FORCE_MOCK=1` (fuerza mock, tests/diagnóstico).
+- **Aislamiento de memoria**: los pipelines diffusers no se cargan en el
+  proceso del worker, sino en un hijo (`engines/worker_host.py`, uno por
+  modelo, protocolo JSON por stdin/stdout). Si un modelo agota la RAM, el
+  sistema mata a ese hijo: el job termina en `FAILED` y el worker sigue
+  atendiendo. Además, al morir el hijo el SO recupera toda su memoria de
+  inmediato — `gc.collect()` dentro del worker no devolvía los ~27 GB de Wan
+  y la carga siguiente se quedaba sin RAM a mitad de shard. Además corre **un
+  solo modelo pesado (`vram_gb >= 6`) a la vez**: el segundo job espera su
+  turno emitiendo `LOADING_MODEL` (sin bloquear `ListModels`, telemetría ni
+  cancelaciones), y los modelos livianos siguen ejecutándose en paralelo.
+- **VRAM por etapas (Wan en GPU):** en 8 GB el pipeline entero no entra: el
+  text encoder 4-bit solo pide 7,4 GB (bnb deja el embedding y las FFN `wo`
+  fuera de la cuantización) y el driver empieza a paginar pesos a RAM del
+  sistema, con lo que un paso de denoising pasa de 2 s a 141 s. Por eso el
+  text encoder se sube sólo para codificar el prompt y vuelve a CPU, y el
+  transformer y el VAE entran y salen con hooks de accelerate. La carga hace
+  además un encode de calentamiento (~12 s): sin él, el primer job pagaba
+  ~40 s de kernels de bitsandbytes en frío. Las FFN `wo` que bnb deja en fp32
+  se castean a fp16 parámetro por parámetro (5,5 GB en vez de 7,4 GB); medido
+  contra el mismo clip con `wo` en fp32 y la misma semilla, la diferencia de
+  píxeles es del 0,4 % y no aparecen NaN ni frames planos. Medido con
+  `bench_gpu.py`: mismo video de 8 frames en 9,4 s (antes 464 s), con pico de
+  6,0 GB; el primer job tras cargar tarda 67 s, casi todo carga.
 
 ---
 

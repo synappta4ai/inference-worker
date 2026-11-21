@@ -12,11 +12,16 @@ carga cacheada, el loop de progreso real, la cancelación y el guardado.
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
+import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
+from dataclasses import asdict
 from typing import Callable
 
 from .base import EngineContext, ModelSpec
@@ -60,11 +65,46 @@ def _release_pipelines() -> int:
     return n
 
 
+# RAM extra mientras se cargan los shards (intérprete, tensores temporales,
+# buffers de activación). No es el modelo: es el costo fijo de cargarlo.
+_RAM_OVERHEAD_GB = 1.5
+
+
+def _load_need_gb(spec: ModelSpec, use_gpu: bool) -> tuple[float, str, float]:
+    """Cuánta RAM necesita el modelo al cargar, medido con sus pesos REALES.
+
+    El catálogo declara VRAM estimada (Wan-1.3B dice 6 GB), que en CPU no
+    significa nada: sus safetensors pesan ~27 GB y el pipeline vive entero en
+    RAM. Antes el guardia comparaba 6 x 1.5 = 9 GB contra 25 GB "libres" y
+    dejaba cargar hasta que el sistema mataba el proceso a mitad de un shard.
+
+    Devuelve (GB necesarios, de dónde sale el número, GB de pesos en disco).
+    """
+    try:
+        from model_ops import weights_size_bytes  # tardío: evita ciclo de imports
+
+        weights_gb = weights_size_bytes(spec.repo) / 1024**3
+    except Exception:  # noqa: BLE001 — sin medida real se usa el catálogo
+        weights_gb = 0.0
+    if weights_gb <= 0:
+        # Sin pesos en disco no hay nada que medir: vuelve la estimación
+        # declarada (sólo sirve como orden de magnitud).
+        return spec.vram_gb * (1.1 if use_gpu else 1.5), "catálogo", 0.0
+    if use_gpu:
+        # En GPU los pesos terminan en VRAM (y Wan cuantiza su text encoder a
+        # 4-bit): en RAM queda el pico de carga, ~60 % del disco (fp32 → fp16).
+        need = max(weights_gb * 0.6, spec.vram_gb * 1.1) + _RAM_OVERHEAD_GB
+        return need, "disco", weights_gb
+    # CPU: todo el pipeline se materializa en RAM.
+    return weights_gb + _RAM_OVERHEAD_GB, "disco", weights_gb
+
+
 def _check_memory_before_load(spec: ModelSpec, use_gpu: bool) -> None:
-    """Rechaza el modelo ANTES de descargar pesos si no cabe en la máquina.
+    """Rechaza el modelo ANTES de cargar si no entra en la máquina.
 
     Sin este guardia, un modelo 14B en una laptop revienta el proceso con un
-    abort de Rust (OOM no capturable) y tumba el worker entero.
+    abort de Rust (OOM no capturable) y tumba el worker entero. Corre dentro
+    del hijo: si aun así se quedara sin memoria, muere el hijo y no el worker.
 
     Si no hay espacio, primero suelta pipelines cacheados (un SD-1.5 quedado
     de un job anterior puede ocupar los GB que este modelo necesita) y vuelve
@@ -76,22 +116,27 @@ def _check_memory_before_load(spec: ModelSpec, use_gpu: bool) -> None:
         avail_gb = psutil.virtual_memory().available / 1024**3
     except Exception:
         return
-    # CPU: el modelo vive entero en RAM (margen x1.5). GPU con cpu-offload:
-    # los pesos residen en RAM y fluyen a VRAM por etapas (margen x1.1; el
-    # x1.5 original hacia imposible cargar Wan-1.3B en Colab con 12.7 GB).
-    need_gb = spec.vram_gb * (1.1 if use_gpu else 1.5)
-    if avail_gb < need_gb:
-        _release_pipelines()
-        try:
-            avail_gb = psutil.virtual_memory().available / 1024**3
-        except Exception:
-            return
-        if avail_gb < need_gb:
-            raise MemoryError(
-                f"el modelo '{spec.label}' requiere ~{spec.vram_gb} GB y solo hay "
-                f"{avail_gb:.1f} GB disponibles. Usa un modelo más pequeño o una "
-                "máquina con más memoria."
-            )
+    need_gb, basis, weights_gb = _load_need_gb(spec, use_gpu)
+    if avail_gb >= need_gb:
+        return
+    _release_pipelines()
+    try:
+        avail_gb = psutil.virtual_memory().available / 1024**3
+    except Exception:
+        return
+    if avail_gb >= need_gb:
+        return
+    detalle = (
+        f"{weights_gb:.1f} GB de pesos en disco"
+        if basis == "disco"
+        else f"estimación del catálogo: ~{spec.vram_gb} GB"
+    )
+    raise MemoryError(
+        f"el modelo '{spec.label}' no entra en esta máquina: necesita "
+        f"~{need_gb:.1f} GB de RAM para cargar ({detalle}) y solo hay "
+        f"{avail_gb:.1f} GB libres. Probá un modelo más chico, liberá memoria "
+        "o usá una máquina con más memoria."
+    )
 
 
 # ----------------------------------------------------------------------
@@ -128,6 +173,132 @@ def _load_image_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     return pipe
 
 
+def _enable_vae_opt(pipe, *names: str) -> None:
+    """Activa slicing/tiling del VAE, esté donde esté el método.
+
+    No todos los pipelines exponen `enable_vae_slicing` (WanPipeline solo tiene
+    el del VAE: `pipe.vae.enable_slicing`), y en CPU es la única forma de que
+    quepa un video. Es una optimización: si no existe, se genera igual.
+    """
+    for target in (getattr(pipe, "vae", None), pipe):
+        if target is None:
+            continue
+        for name in names:
+            fn = getattr(target, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 — optimización best-effort
+                logger.warning("[Factory] no pude activar %s: %s", name, exc)
+            return
+
+
+def _offload_sequentially(pipe) -> None:
+    """Uso secuencial de la VRAM: TE, transformer y VAE nunca conviven.
+
+    Medido en la RTX 5070 (8 GB): con el pipeline entero residente el driver
+    paginaba pesos a RAM del sistema (0 GB físicos libres) y un paso de
+    denoising tardaba 141 s en vez de 0,8 s. El text encoder 4-bit solo ya pide
+    5,5 GB, así que tampoco alcanza para tenerlo residente junto al resto.
+
+    El transformer (2,65 GB en fp16) y el VAE entran en VRAM con hooks de
+    accelerate y vuelven a CPU al terminar (`release_vram`); el text encoder se
+    sube para codificar el prompt y baja dentro del mismo `encode_prompt`.
+    """
+    import torch
+    from accelerate import cpu_offload_with_hook
+
+    # El VAE se llama con `.decode()`, así que su hook va en el módulo entero
+    # (diffusers aplica `apply_forward_hook` ahí).
+    cpu_offload_with_hook(pipe.transformer, "cuda")
+    cpu_offload_with_hook(pipe.vae, "cuda")
+
+    te = getattr(pipe, "text_encoder", None)
+    if te is None:
+        return
+    # bnb cuantiza 144 capas a 4-bit pero deja el embedding (1,96 GB) y las FFN
+    # `wo` en fp32 (24 x 0,16 GB; UMT5 las marca `_keep_in_fp32_modules`).
+    # `te.to(dtype)` lo bloquea bnb, así que se castea parámetro por parámetro.
+    for prm in te.parameters():
+        if prm.dtype == torch.float32:
+            prm.data = prm.data.half()
+
+    _wrap_encode_prompt(pipe, te, torch)
+
+    # El primer forward del TE paga ~40 s de kernels de bitsandbytes (el
+    # segundo tarda 0,4 s). Se hace acá, mientras la carga ya está pagando la
+    # cuantización, y se devuelve el TE a RAM para no dejar 5,5 GB ociosos.
+    _warmup_text_encoder(pipe, te, torch)
+    te.to("cpu")
+    torch.cuda.empty_cache()
+
+
+def _wrap_encode_prompt(pipe, te, torch) -> None:
+    """Sube el TE para codificar y lo baja dentro del mismo `encode_prompt`.
+
+    No alcanza con moverlo antes del `pipe(...)`: el encode ocurre dentro, y el
+    TE (5,5 GB en 4-bit) no entra en VRAM junto al transformer. Por eso se
+    envuelve el método del pipeline en vez de duplicar acá su firma, que cambia
+    entre familias de video.
+    """
+    if getattr(pipe, "_bm_encode_wrapped", False):
+        return
+    original = pipe.encode_prompt
+
+    @functools.wraps(original)
+    def encode_then_offload(*args, **kwargs):
+        t0 = time.time()
+        te.to("cuda")
+        t1 = time.time()
+        try:
+            out = original(*args, **kwargs)
+        finally:
+            t2 = time.time()
+            te.to("cpu")
+            torch.cuda.empty_cache()
+        logger.info(
+            "[Factory] encode del prompt en %.1f s (subir %.1f, forward %.1f, "
+            "bajar %.1f)", time.time() - t0, t1 - t0, t2 - t1, time.time() - t2
+        )
+        return out
+
+    pipe.encode_prompt = encode_then_offload
+    pipe._bm_encode_wrapped = True
+
+
+def _warmup_text_encoder(pipe, te, torch) -> None:
+    """Adelanta el primer forward del text encoder durante la carga.
+
+    Medido en la RTX 5070: ese forward cuesta ~40 s (init de kernels de
+    bitsandbytes) y los siguientes 0,4 s. Hacerlo al cargar deja el primer job
+    con el mismo tiempo que los demás. Es un adelanto, no un requisito: si el
+    pipeline no expone tokenizer o el forward falla, se sigue igual.
+    """
+    tokenizer = getattr(pipe, "tokenizer", None)
+    if not callable(tokenizer):
+        return
+    t0 = time.time()
+    try:
+        largos = [64]
+        maximo = getattr(tokenizer, "model_max_length", 64)
+        if isinstance(maximo, int) and 0 < maximo < 10**6:
+            largos.append(maximo)
+        ids = tokenizer(
+            ["calentamiento"],
+            padding="max_length",
+            max_length=min(largos),
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to("cuda")
+        with torch.no_grad():
+            te(ids)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("[Factory] calentamiento del text encoder falló: %s", exc)
+        return
+    logger.info("[Factory] text encoder caliente en %.1f s", time.time() - t0)
+
+
 def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     """Carga un pipeline de texto-a-video según su familia diffusers."""
     import torch
@@ -152,48 +323,52 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
         raise ValueError(f"familia de video no soportada para {repo}")
 
     logger.info("[Factory] Cargando video %s (gpu=%s, %s)...", repo, use_gpu, dtype_str)
-    # Los repos Diffusers sirven los text encoders en fp32 (el UMT5-XXL de
-    # Wan: 21 GB de los ~27 del repo). Cuantizarlo a 4-bit es lo que hace
-    # que Wan-1.3B quepa (~13.5 GB → ~6 GB): sin esto, una T4/Colab (10 GB
-    # de RAM) nunca puede cargarlo. Los pesos 4-bit viven en GPU, así que
-    # el pipeline corre sin cpu-offload (además, más rápido).
-    te_quant = False
     kwargs = {"torch_dtype": dtype}
     if use_gpu and "wan" in lower:
+        # El UMT5-XXL en fp16 pide ~10,6 GB: sin 4-bit Wan-1.3B no entra en 8.
         try:
             import bitsandbytes  # noqa: F401
-
-            from transformers import BitsAndBytesConfig
-
-            kwargs["text_encoder_quant_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-            )
-            te_quant = True
-            logger.info("[Factory] text encoder a 4-bit (nf4): ahorra ~18 GB")
-        except ImportError:
+        except ImportError as exc:
             raise RuntimeError(
-                "Wan en GPU requiere 'bitsandbytes' (cuantiza el text encoder "
-                "de 21 GB fp32 a ~2.5 GB); instalalo y reintenta"
-            )
+                "Wan en GPU requiere 'bitsandbytes' para cuantizar el text "
+                "encoder (21 GB fp32 -> ~2,5 GB); instalalo y reintenta"
+            ) from exc
+        # diffusers >= 0.34 cuantiza por componente con
+        # PipelineQuantizationConfig (`text_encoder_quant_config` no existe).
+        from diffusers.quantizers import PipelineQuantizationConfig
+
+        kwargs["quantization_config"] = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": torch.float16,
+            },
+            components_to_quantize=["text_encoder"],
+        )
+        logger.info("[Factory] text encoder a 4-bit (nf4): ahorra ~18 GB")
+
     from model_ops import require_weights  # tardío: evita ciclo de imports
 
     require_weights(repo)
     pipe = cls.from_pretrained(repo, **kwargs)
-    # Los videos son pesados: offload siempre que exista; en CPU es lo único
-    # que cabe junto con attention slicing.
     if use_gpu:
-        if te_quant:
-            # bnb 4-bit no soporta moverse CPU<->GPU: el pipeline entero se
-            # queda en VRAM (cabe: ese es justo el objetivo de cuantizar).
-            logger.info("[Factory] %s en VRAM completa (sin offload)", repo)
+        # La cuantización deja ~5 GB de área de trabajo en el allocator: si no
+        # se devuelve, el job arranca paginando pesos a RAM del sistema.
+        torch.cuda.empty_cache()
+        if "quantization_config" in kwargs:
+            _offload_sequentially(pipe)
+            logger.info(
+                "[Factory] %s por etapas: text encoder 4-bit, transformer y VAE "
+                "entran y salen de VRAM",
+                repo,
+            )
         else:
             pipe.enable_model_cpu_offload()
     else:
         pipe.enable_attention_slicing()
-        pipe.enable_vae_slicing()
-    pipe.vae.enable_tiling()
+        _enable_vae_opt(pipe, "enable_slicing", "enable_vae_slicing")
+    _enable_vae_opt(pipe, "enable_tiling", "enable_vae_tiling")
     return pipe
 
 
@@ -203,12 +378,57 @@ LOADERS = {
 }
 
 
+def _pipeline_loaded(spec: ModelSpec, use_gpu: bool) -> bool:
+    """true si este proceso ya tiene el pipeline cargado y cacheado."""
+    with _LOCK:
+        return (spec.pipeline, spec.repo, use_gpu) in _PIPELINES
+
+
+def release_vram(pipe) -> None:
+    """Devuelve a RAM las componentes con hook de offload al terminar un job.
+
+    Sin esto el transformer y el VAE quedan en VRAM entre jobs (el pipeline
+    sigue cacheado en RAM, que es barato de volver a subir).
+    """
+    for module in list(getattr(pipe, "components", {}).values()):
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None:
+            continue
+        try:
+            # Hay dos tipos de hook: los de `cpu_offload_with_hook`
+            # (`UserCpuOffloadHook`, con `offload()`) y el `CpuOffload` de
+            # `enable_model_cpu_offload`, que sólo sabe volver a CPU por
+            # `init_hook(module)`.
+            apagar = getattr(hook, "offload", None)
+            if callable(apagar):
+                apagar()
+            else:
+                iniciar = getattr(hook, "init_hook", None)
+                if callable(iniciar):
+                    iniciar(module)
+        except Exception:  # noqa: BLE001 — limpieza best-effort
+            pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _get_pipeline(spec: ModelSpec, use_gpu: bool):
+    # Un mode fuera de LOADERS es una spec mal declarada (engine diffusers con
+    # un modo que no es de difusión): mejor decirlo acá, con modelo y modo, que
+    # dejar que reviente el dict. Se valida antes de la caché para que el error
+    # no dependa de si el pipeline ya estaba cargado.
+    _validate_mode(spec)
+    loader = LOADERS[spec.mode]
     key = (spec.pipeline, spec.repo, use_gpu)
     with _LOCK:
         if key in _PIPELINES:
             return _PIPELINES[key]
-        pipe = LOADERS[spec.mode](spec.repo, use_gpu, spec.dtype)
+        pipe = loader(spec.repo, use_gpu, spec.dtype)
         _PIPELINES[key] = pipe
         return pipe
 
@@ -262,7 +482,8 @@ def _run_image(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
     return image
 
 
-def _run_video(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int):
+def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
+               cancel, steps: int):
     """Genera video real: frames decodificados del VAE + MP4 con imageio."""
     import imageio
     import numpy as np
@@ -270,9 +491,15 @@ def _run_video(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
     frames = max(8, min(int(req.num_frames or 48), 257))
     fps = max(1, int(req.fps or 16))
 
+    marca = {"t": time.time()}
+
     def on_step_end(_p, step_index, _t, cb_kwargs):
         if cancel.is_set():
             raise _CancelledError()
+        ahora = time.time()
+        logger.info("[Factory] paso %s/%s en %.1f s", step_index + 1, steps,
+                    ahora - marca["t"])
+        marca["t"] = ahora
         report(min(step_index + 1, steps) / steps * 88.0, "GENERATING")
         return {}
 
@@ -286,14 +513,26 @@ def _run_video(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
         kwargs["guidance_scale"] = spec.guidance_scale
     if (req.negative_prompt or "").strip():
         kwargs["negative_prompt"] = req.negative_prompt
+    if req.seed:
+        # Misma seed, mismo clip: sin esto cada job arranca de otros latentes.
+        import torch
 
+        kwargs["generator"] = torch.Generator(
+            device="cuda" if _has_cuda() else "cpu"
+        ).manual_seed(req.seed)
+
+    t_pipe = time.time()
     result = pipe(**kwargs)
+    logger.info("[Factory] pipeline completo en %.1f s", time.time() - t_pipe)
     video_frames = result.frames[0]  # lista/array de frames RGB
 
     out_name = f"{req.job_id}.mp4"
     report(90.0, "POSTPROCESSING")
+    # Igual que la imagen: el archivo va al out_dir del motor (el que sirve el
+    # artifact server) y el evento devuelve el nombre relativo.
     with imageio.get_writer(
-        out_name, fps=fps, codec="libx264", quality=7, pixelformat="yuv420p"
+        os.path.join(out_dir, out_name),
+        fps=fps, codec="libx264", quality=7, pixelformat="yuv420p",
     ) as writer:
         for i, frame in enumerate(video_frames):
             arr = frame if isinstance(frame, np.ndarray) else np.asarray(frame)
@@ -304,54 +543,331 @@ def _run_video(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
 
 
 # ----------------------------------------------------------------------
-# Generador async (puente thread → asyncio con cola)
+# Supervisión: un proceso hijo por modelo (aislamiento de memoria)
+# ----------------------------------------------------------------------
+#
+# Un pipeline grande vive en `engines/worker_host.py`, nunca acá. Motivo: si
+# un modelo agota la RAM, el SO mata el proceso de golpe (no hay excepción que
+# atrapar) y antes eso se llevaba al worker entero. En un hijo, ese final es un
+# job FAILED y el servicio sigue vivo. Al morir el hijo, el SO recupera toda su
+# memoria de inmediato: `gc.collect()` dentro del worker dejaba páginas que el
+# proceso no devolvía y la siguiente carga de Wan se quedaba sin RAM.
+
+_WORKER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Lista (no string) para que los tests puedan sustituir el intérprete por un
+# hijo falso y ejercitar la supervisión sin cargar pesos reales.
+_HOST_CMD = [sys.executable, "-u", "-m", "engines.worker_host"]
+
+# repo → hijo vivo. Un solo modelo cargado a la vez: con dos de ~27 GB la
+# máquina se queda sin RAM aunque "quepan" por separado.
+_HOSTS: dict[str, "_Host"] = {}
+_HOST_LOCK = threading.Lock()
+
+_CRASH_ERR = (
+    "el proceso de generación se cerró de golpe con '{label}' (lo más "
+    "probable: se quedó sin RAM). El worker sigue funcionando: probá un "
+    "modelo más liviano o liberá memoria y reintentá."
+)
+
+
+class _Host:
+    """Proceso hijo que carga un modelo y ejecuta jobs de a uno.
+
+    El hijo cachea su pipeline entre jobs (misma ventaja de antes), pero su
+    memoria es suya: si se cae, se descarta el proceso y el worker sobrevive.
+    """
+
+    def __init__(self, key: str, payload: dict) -> None:
+        self.key = key
+        self.label = str(payload.get("label") or payload.get("key") or key)
+        self.proc = subprocess.Popen(
+            list(_HOST_CMD) + [json.dumps(payload), "auto"],
+            cwd=_WORKER_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # stderr heredado: los warnings de diffusers y el tqdm siguen
+            # cayendo en worker.log, y no ensucian el canal JSON.
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env={**os.environ, "PYTHONUNBUFFERED": "1",
+                 "PYTHONIOENCODING": "utf-8"},
+        )
+        self._queue = None
+        self._loop = None
+        self._job_open = True   # reservado desde que existe
+        self._terminal = False
+        self._lock = None
+        threading.Thread(
+            target=self._read_stdout, name=f"host-{key}", daemon=True
+        ).start()
+
+    # -- estado -------------------------------------------------------
+    @property
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    @property
+    def idle(self) -> bool:
+        return not self._job_open
+
+    @property
+    def finished(self) -> bool:
+        return self._terminal
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    # -- E/S ----------------------------------------------------------
+    def _deliver(self, evt) -> None:
+        loop, queue = self._loop, self._queue
+        if loop is None or queue is None:
+            return
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, evt)
+        except RuntimeError:  # loop cerrado (apagando el worker)
+            pass
+
+    def _read_stdout(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    logger.debug("[Host %s] salida no-JSON: %s", self.key, line[:200])
+                    continue
+                kind = msg.get("type")
+                if kind == "log":
+                    logger.info("[Host %s] %s", self.key, msg.get("msg", ""))
+                    continue
+                if kind != "event":
+                    continue
+                evt = (
+                    float(msg.get("pct") or 0.0),
+                    str(msg.get("status") or ""),
+                    str(msg.get("out") or ""),
+                    str(msg.get("err") or ""),
+                )
+                if evt[1] in ("COMPLETED", "FAILED", "CANCELLED"):
+                    self._terminal = True
+                self._deliver(evt)
+        finally:
+            # EOF: el hijo murió (OOM del sistema, crash nativo, kill).
+            if self._job_open and not self._terminal:
+                self._terminal = True
+                self._deliver(
+                    (0.0, "FAILED", "", _CRASH_ERR.format(label=self.label))
+                )
+            logger.info("[Host %s] proceso terminó (código %s)",
+                        self.key, self.proc.poll())
+
+    def send(self, msg: dict) -> None:
+        if not self.alive or self.proc.stdin is None:
+            raise OSError("el proceso de generación ya no está vivo")
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def cancel(self) -> None:
+        try:
+            self.send({"cmd": "cancel"})
+        except OSError:
+            pass
+
+    def kill(self) -> None:
+        if not self.alive:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    # -- ciclo de vida de un job --------------------------------------
+    def attach(self, loop, queue) -> None:
+        self._loop, self._queue = loop, queue
+        self._terminal = False
+        self._job_open = True
+
+    def finish(self) -> None:
+        self._job_open = False
+        self._loop, self._queue = None, None
+
+
+def _host_for(spec: ModelSpec) -> "_Host":
+    """Hijo del modelo `spec`, matando a los ociosos de otros modelos."""
+    key = spec.repo or spec.key
+    with _HOST_LOCK:
+        host = _HOSTS.get(key)
+        if host is not None and host.alive and not host.idle:
+            return host
+        if host is not None and host.alive:
+            return host
+        _HOSTS.pop(key, None)
+        for other_key, other in list(_HOSTS.items()):
+            if other.idle:
+                other.kill()
+                _HOSTS.pop(other_key, None)
+        host = _Host(key, asdict(spec))
+        _HOSTS[key] = host
+        return host
+
+
+def active_hosts() -> list[str]:
+    """Repos cargados ahora mismo (telemetría y tests)."""
+    with _HOST_LOCK:
+        return [key for key, host in _HOSTS.items() if host.alive]
+
+
+def _validate_mode(spec: ModelSpec) -> None:
+    """Un `mode` fuera de LOADERS es una spec mal declarada (engine diffusers
+    con un modo que no es de difusión): se dice acá, con modelo y modo."""
+    if spec.mode not in LOADERS:
+        raise ValueError(
+            f"modo sin loader diffusers: {spec.mode!r} (modelo {spec.key!r}); "
+            f"modes soportados: {sorted(LOADERS)}"
+        )
+
+
+def _request_payload(req) -> dict:
+    """Campos que necesitan los runners, serializables en JSON."""
+    return {
+        "job_id": str(getattr(req, "job_id", "") or ""),
+        "prompt": str(getattr(req, "prompt", "") or ""),
+        "negative_prompt": str(getattr(req, "negative_prompt", "") or ""),
+        "width": int(getattr(req, "width", 0) or 0),
+        "height": int(getattr(req, "height", 0) or 0),
+        "num_frames": int(getattr(req, "num_frames", 0) or 0),
+        "fps": int(getattr(req, "fps", 0) or 0),
+        "seed": int(getattr(req, "seed", 0) or 0),
+    }
+
+
+# ----------------------------------------------------------------------
+# Generador async: puente cola del hijo → evento gRPC
+# Umbral (GB) a partir del cual un modelo pesa demasiado para convivir con
+# otro: dos pipelines de ~27 GB (Wan, FLUX, SDXL) no entran juntos en una
+# máquina de 32 GB y el SO terminaría matando a los dos hijos. Los livianos
+# (SD-Tiny ~2 GB, SD-1.5 ~4 GB) sí pueden correr en paralelo.
+_HEAVY_GB = 6
+
+# Compuerta de un solo carril para los modelos pesados. Se ata al loop en uso
+# (el worker tiene uno; los tests abren uno por caso).
+_GATE: tuple[object, asyncio.Semaphore] | None = None
+
+
+def _heavy(spec: ModelSpec) -> bool:
+    """true si el modelo, cargado, ocupa RAM como para no convivir con otro."""
+    return int(spec.vram_gb or 0) >= _HEAVY_GB
+
+
+def _heavy_gate() -> asyncio.Semaphore:
+    global _GATE
+    loop = asyncio.get_running_loop()
+    if _GATE is None or _GATE[0] is not loop:
+        _GATE = (loop, asyncio.Semaphore(1))
+    return _GATE[1]
+
+
+# ----------------------------------------------------------------------
+# Generador async: puente cola del hijo → evento gRPC
 # ----------------------------------------------------------------------
 
-async def generate(req, spec: ModelSpec, ctx: EngineContext):
+async def _stream_from_host(req, spec: ModelSpec, ctx: EngineContext):
+    """Pide el job al hijo del modelo y traduce su salida a eventos gRPC."""
     loop = asyncio.get_running_loop()
-    use_gpu = _has_cuda()
     steps = max(1, min(int(req.steps or spec.steps), 60))
     t0 = time.time()
 
-    events: asyncio.Queue = asyncio.Queue()
+    try:
+        host = _host_for(spec)
+    except OSError as exc:
+        logger.exception("[Factory] no pude arrancar el hijo de %s", spec.repo)
+        yield (0.0, "FAILED", "", f"no pude arrancar el proceso de generación: {exc}")
+        return
 
-    def report(pct: float, status: str, out: str = "", err: str = "") -> None:
-        loop.call_soon_threadsafe(events.put_nowait, (pct, status, out, err))
-
-    def worker() -> None:
+    queue: asyncio.Queue = asyncio.Queue()
+    async with host.lock:
+        host.attach(loop, queue)
+        cancel_sent = False
         try:
-            report(0.0, "LOADING_MODEL")
-            _check_memory_before_load(spec, use_gpu)
-            pipe = _get_pipeline(spec, use_gpu)
-            logger.info(
-                "[Factory] %s listo en %.1fs (gpu=%s, pasos=%d)",
-                spec.repo, time.time() - t0, use_gpu, steps,
-            )
-            report(1.0, "GENERATING")
+            try:
+                host.send({
+                    "cmd": "job",
+                    "steps": steps,
+                    "out_dir": ctx.out_dir,
+                    "request": _request_payload(req),
+                })
+            except OSError:
+                yield (0.0, "FAILED", "", _CRASH_ERR.format(label=spec.label))
+                return
 
-            if spec.mode == "video":
-                out_name = _run_video(pipe, req, spec, report, ctx.cancel, steps)
-            else:
-                image = _run_image(pipe, req, spec, report, ctx.cancel, steps)
-                report(90.0, "POSTPROCESSING")
-                out_name = f"{req.job_id}.png"
-                image.save(os.path.join(ctx.out_dir, out_name), format="PNG")
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    # CancelGeneration del gateway: se traduce al hijo, que
+                    # corta en el próximo callback de paso.
+                    if ctx.cancel.is_set() and not cancel_sent:
+                        host.cancel()
+                        cancel_sent = True
+                    continue
+                yield evt
+                if evt[1] in ("COMPLETED", "FAILED", "CANCELLED"):
+                    logger.info(
+                        "[Factory] %s %s en %.1fs", req.job_id,
+                        "completado" if evt[1] == "COMPLETED" else evt[1].lower(),
+                        time.time() - t0,
+                    )
+                    return
+        finally:
+            host.finish()
+            # Cliente desconectado o consumo cortado: el hijo no puede seguir
+            # generando solo (y ocupando RAM) sin que nadie escuche.
+            if not host.finished and host.alive:
+                host.cancel()
 
-            logger.info("[Factory] %s completado en %.1fs", req.job_id, time.time() - t0)
-            report(100.0, "COMPLETED", out_name)
-        except _CancelledError:
-            logger.info("[Factory] %s cancelado", req.job_id)
-            report(0.0, "CANCELLED")
-        except Exception as exc:
-            logger.exception("[Factory] %s falló: %s", req.job_id, exc)
-            report(0.0, "FAILED", "", f"{spec.pipeline}: {exc}")
 
-    threading.Thread(
-        target=worker, name=f"diff-{req.job_id}", daemon=True
-    ).start()
+async def generate(req, spec: ModelSpec, ctx: EngineContext):
+    _validate_mode(spec)  # falla antes de arrancar un proceso
 
-    while True:
-        pct, status, out, err = await events.get()
-        yield (pct, status, out, err)
-        if status in ("COMPLETED", "FAILED", "CANCELLED"):
+    gate = _heavy_gate() if _heavy(spec) else None
+    if gate is not None:
+        if gate.locked():
+            # Encolado detrás de otro modelo pesado: se emite LOADING_MODEL
+            # para que el front no muestre un job mudo. Sólo espera ESTE job:
+            # el loop sigue sirviendo ListModels, telemetría y cancelaciones.
+            yield (0.0, "LOADING_MODEL")
+        while True:
+            if ctx.cancel.is_set():
+                yield (0.0, "CANCELLED")
+                return
+            try:
+                await asyncio.wait_for(gate.acquire(), timeout=0.2)
+                break
+            except asyncio.TimeoutError:
+                continue
+        if ctx.cancel.is_set():
+            gate.release()
+            yield (0.0, "CANCELLED")
             return
+
+    try:
+        async for evt in _stream_from_host(req, spec, ctx):
+            yield evt
+    finally:
+        # También al cerrar el generador (cliente desconectado): el carril se
+        # libera siempre, sin dejar pesados esperando para siempre.
+        if gate is not None:
+            gate.release()

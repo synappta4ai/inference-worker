@@ -218,6 +218,22 @@ def repo_cache_dir(repo: str | None) -> str | None:
     return os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
 
 
+def weights_size_bytes(repo: str | None) -> int:
+    """Bytes de los pesos del repo EN DISCO (cada archivo real una sola vez).
+
+    Es la medida que usa el guardia de memoria antes de cargar: el catálogo
+    sólo declara VRAM estimada (Wan-1.3B dice 6 GB) y en CPU el pipeline vive
+    entero en RAM, así que el peso en disco es el único dato honesto. Se
+    cuenta `blobs/`: en Windows el snapshot es un hardlink del blob y sumar el
+    directorio completo duplicaba el tamaño.
+    """
+    d = repo_cache_dir(repo)
+    if d is None or not os.path.isdir(d):
+        return 0
+    blobs = os.path.join(d, "blobs")
+    return _dir_size(blobs if os.path.isdir(blobs) else d)
+
+
 def _read_tree(d: str) -> dict | None:
     """Árbol del repo guardado por huggingface (`trees/<commit>.json`)."""
     tree_dir = os.path.join(d, "trees")
@@ -273,14 +289,16 @@ def inspect_repo(repo: str | None) -> RepoStats:
 
     # Descargas a medio terminar: blobs/<blob_id>.<x>.incomplete
     partial: dict[str, int] = {}
+    complete_blobs = 0
     blobs_dir = os.path.join(d, "blobs")
     if os.path.isdir(blobs_dir):
         for f in os.listdir(blobs_dir):
-            if not f.endswith(".incomplete"):
-                continue
             try:
                 size = os.path.getsize(os.path.join(blobs_dir, f))
             except OSError:
+                continue
+            if not f.endswith(".incomplete"):
+                complete_blobs += size
                 continue
             partial[f.split(".", 1)[0]] = size
             stats.partial_disk_bytes += size
@@ -305,7 +323,14 @@ def inspect_repo(repo: str | None) -> RepoStats:
         # Sin árbol (caché de versiones viejas): heurística — hay snapshot,
         # no hay .incomplete y hay algún peso. El total se desconoce. Los bytes
         # a medio bajar quedan fuera del "descargado": son restos.
-        stats.committed = max(0, stats.on_disk - stats.partial_disk_bytes)
+        # Se cuentan desde `blobs` y una sola vez: en Windows el snapshot
+        # apunta al blob, así que sumar el directorio entero duplicaba el peso
+        # (57 GB mostrados para un repo de 29 GB).
+        stats.committed = (
+            complete_blobs
+            if complete_blobs
+            else max(0, stats.on_disk - stats.partial_disk_bytes)
+        )
         stats.partial_bytes = stats.partial_disk_bytes
         stats.downloaded = stats.committed + stats.partial_bytes
         stats.complete = (
@@ -321,13 +346,53 @@ def inspect_repo(repo: str | None) -> RepoStats:
 
 
 def _dir_size(path: str) -> int:
+    """Bytes ocupados en disco, contando hardlinks/symlinks una sola vez.
+
+    huggingface_hub crea el archivo del snapshot como enlace al blob: sumar
+    las dos rutas (lo que hacía `getsize` por archivo) duplicaba el peso real
+    del modelo en el panel.
+    """
     total = 0
+    seen: set[tuple[int, int]] = set()
     for root, _dirs, files in os.walk(path):
         for f in files:
             try:
-                total += os.path.getsize(os.path.join(root, f))
+                st = os.stat(os.path.join(root, f))
             except OSError:
                 continue
+            # `st_ino == 0` (sin identidad de archivo): no se puede deduplicar.
+            if st.st_ino:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+            total += st.st_size
+    return total
+
+
+def remote_total_bytes(repo: str | None) -> int:
+    """Bytes totales que pesa el repo según Hugging Face (0 si no se sabe).
+
+    El árbol local (`trees/*.json`) no existe hasta que la descarga avanza,
+    así que sin este dato el panel mostraba "0 %" mientras los GB subían.
+    Es una consulta de metadatos, sin bajar pesos.
+    """
+    if not repo:
+        return 0
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo, files_metadata=True)
+    except Exception as exc:  # noqa: BLE001 — sin red/privado: total desconocido
+        logger.debug("[model_ops] total remoto de %s no disponible: %s", repo, exc)
+        return 0
+    siblings = getattr(info, "siblings", None) or []
+    total = 0
+    for sib in siblings:
+        try:
+            total += int(getattr(sib, "size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
     return total
 
 
@@ -594,6 +659,13 @@ class ModelOps:
         with self._lock:
             op.total_bytes = inspect_repo(spec.repo).total
             epoch = _abort_epoch
+
+        # Total real del repo (metadatos, sin bajar pesos): es lo que hace que
+        # el porcentaje y los bytes mostrados hablen del mismo total.
+        remote_total = remote_total_bytes(spec.repo)
+        if remote_total:
+            with self._lock:
+                op.total_bytes = max(op.total_bytes, remote_total)
 
         try:
             snapshot_download(
