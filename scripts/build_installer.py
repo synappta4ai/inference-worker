@@ -37,7 +37,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 WORKER_ROOT = Path(__file__).resolve().parent.parent
-FRONT_ASSETS = WORKER_ROOT.parent / "front-synapta" / "src" / "assets" / "worker"
+FRONT_ASSETS = WORKER_ROOT.parent / "front-synappta" / "src" / "assets" / "worker"
 
 sys.path.insert(0, str(WORKER_ROOT))
 from installer import core  # noqa: E402
