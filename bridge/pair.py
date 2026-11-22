@@ -38,6 +38,7 @@ def pair(back_url: str, code: str, name: str = ""):
         version=BRIDGE_VERSION,
         vram_total_mb=snap["vram_total_mb"],
         vram_free_mb=snap["vram_free_mb"],
+        disk_free_mb=snap["disk_free_mb"],
         models=snap["models"],
     )
     worker_id = str(resp.get("worker_id", ""))

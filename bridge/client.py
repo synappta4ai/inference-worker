@@ -117,7 +117,7 @@ class BridgeClient:
 
     def register(self, code: str, name: str, gpu_name: str, os_name: str,
                  version: str, vram_total_mb: int, vram_free_mb: int,
-                 models: list) -> dict:
+                 models: list, disk_free_mb: int = 0) -> dict:
         """Canjea el código de emparejamiento por el token de larga duración."""
         return self._request("POST", "/api/v1/internal/workers/register", {
             "code": code,
@@ -127,12 +127,14 @@ class BridgeClient:
             "version": version,
             "vram_total_mb": vram_total_mb,
             "vram_free_mb": vram_free_mb,
+            "disk_free_mb": disk_free_mb,
             "models": models,
         })
 
     def heartbeat(self, gpu_name: str, version: str, vram_free_mb: int,
                   jobs_active: int, models: list,
-                  completed_downloads: Optional[list] = None) -> dict:
+                  completed_downloads: Optional[list] = None,
+                  disk_free_mb: int = 0) -> dict:
         """Refresh del estado vivo.
 
         Devuelve {"cancel_task_ids": [...], "requested_models": [...]}:
@@ -144,6 +146,7 @@ class BridgeClient:
             "gpu_name": gpu_name,
             "version": version,
             "vram_free_mb": vram_free_mb,
+            "disk_free_mb": disk_free_mb,
             "jobs_active": jobs_active,
             "models": models,
             "completed_downloads": list(completed_downloads or []),

@@ -82,6 +82,21 @@ def _local_model_states() -> dict:
     return out
 
 
+def disk_free_mb() -> int:
+    """Espacio libre donde viven los pesos (0 si no se puede leer).
+
+    El panel lo usa para avisar antes de descargar: sin este dato, una
+    descarga de 9 GB en una máquina sin espacio solo fallaba al final.
+    """
+    try:
+        import shutil
+        from pathlib import Path
+
+        return int(shutil.disk_usage(Path(__file__).resolve().parents[1]).free // (1024 * 1024))
+    except Exception:  # noqa: BLE001 — telemetría best-effort, nunca bloquea
+        return 0
+
+
 def gpu_snapshot() -> dict:
     """Telemetría de GPU + catálogo, en el formato que espera el back.
 
@@ -127,6 +142,7 @@ def gpu_snapshot() -> dict:
         "gpu_name": tel.get("device_name", "CPU / No CUDA"),
         "vram_total_mb": int(tel.get("total_vram_mb", 0)),
         "vram_free_mb": int(tel.get("free_vram_mb", 0)),
+        "disk_free_mb": disk_free_mb(),
         "models": models,
     }
 
@@ -209,6 +225,7 @@ class Agent:
                     gpu_name=snap["gpu_name"],
                     version=BRIDGE_VERSION,
                     vram_free_mb=snap["vram_free_mb"],
+                    disk_free_mb=snap["disk_free_mb"],
                     jobs_active=self._jobs_active,
                     models=snap["models"],
                     completed_downloads=pending_acks,
