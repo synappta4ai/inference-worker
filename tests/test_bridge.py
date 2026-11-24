@@ -30,6 +30,8 @@ class FakeBack(BaseHTTPRequestHandler):
     cancel_ids: list = []
     requested_models: list = []
     claimed_job: dict | None = None
+    # True = el claim devuelve el job pelado en `data` (forma de backs viejos).
+    bare_job = False
     reports: list = []
     uploads: list = []
     revoked = False
@@ -67,6 +69,9 @@ class FakeBack(BaseHTTPRequestHandler):
         if self.path.startswith("/api/v1/internal/workers/claim"):
             job = self.claimed_job
             self.claimed_job = None  # solo una entrega
+            if self.bare_job:
+                # Forma que devolvía el back real (`data` = job pelado).
+                return self._json(200, {"success": True, "data": job})
             return self._json(200, {"success": True, "data": {"job": job}})
         if self.path.startswith("/api/v1/internal/workers/report"):
             self.reports.append(json.loads(raw))
@@ -94,6 +99,7 @@ def fake_back():
     FakeBack.registered_codes = {"123456"}
     FakeBack.heartbeats, FakeBack.reports, FakeBack.uploads = [], [], []
     FakeBack.cancel_ids, FakeBack.claimed_job = [], None
+    FakeBack.bare_job = False
     FakeBack.requested_models = []
     FakeBack.revoked = False
     server = HTTPServer(("127.0.0.1", 0), FakeBack)
@@ -247,6 +253,20 @@ def test_client_claim_empty_and_delivered(fake_back):
     job = client.claim(wait_seconds=1)
     assert job is not None and job.task_id == "syn_5"
     assert job.payload["model_name"] == "Wan2.1"
+
+
+def test_client_claim_accepts_bare_job_payload(fake_back):
+    """Backs que devuelven el job pelado en `data` (sin la clave `job`).
+
+    Si el cliente lo descarta, el back ya marcó la fila 'running' y el trabajo
+    no lo ejecuta nadie: la toma se queda en 0 % para siempre, sin error.
+    """
+    client = BridgeClient(fake_back, token="tok-secret")
+    FakeBack.bare_job = True
+    FakeBack.claimed_job = {"task_id": "syn_7",
+                            "payload": {"model_name": "SD-Tiny-Test"}}
+    job = client.claim(wait_seconds=1)
+    assert job is not None and job.task_id == "syn_7"
 
 
 def test_client_report_and_upload(fake_back, tmp_path):

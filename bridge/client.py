@@ -168,6 +168,11 @@ class BridgeClient:
             {}, timeout=wait_seconds + 10.0,
         )
         raw = data.get("job") if isinstance(data, dict) else None
+        if not raw and isinstance(data, dict) and data.get("task_id"):
+            # Backs viejos devolvían el job pelado en `data`. Se acepta también
+            # así: descartarlo en silencio dejaba la fila 'running' del lado del
+            # back sin que nadie ejecute el trabajo (la toma clavada en 0 %).
+            raw = data
         if not raw or not isinstance(raw, dict):
             return None
         job = Job.from_api(raw)
