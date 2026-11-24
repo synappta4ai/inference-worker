@@ -1020,8 +1020,53 @@ def start(workdir: Optional[Path] = None, wait: float = 20.0) -> None:
                    GRPC_PORT, wait)
 
 
+def port_pid(port: int = GRPC_PORT) -> Optional[int]:
+    """PID que escucha en `port` (Windows), o None.
+
+    El worker puede estar corriendo sin `worker.pid`: lo arrancó un script, una
+    tarea programada o el atajo de inicio viejo. Sin esto, una actualización
+    extrae los archivos sobre un proceso vivo y después cree que arrancó el
+    nuevo (el puerto seguía ocupado), dejando el worker caído al rato.
+    """
+    if os.name != "nt":
+        return None
+    rc, lines = run_capture(["netstat", "-ano", "-p", "TCP"], timeout=30)
+    if rc != 0:
+        return None
+    sufijo = f":{port}"
+    for line in lines:
+        partes = line.split()
+        if len(partes) < 4:
+            continue
+        local, estado, pid = partes[1], partes[-2], partes[-1]
+        if estado.upper() != "LISTENING" or not local.endswith(sufijo):
+            continue
+        if pid.isdigit() and int(pid) > 0:
+            return int(pid)
+    return None
+
+
+def process_name(pid: int) -> str:
+    """Nombre del ejecutable de `pid` (`python.exe`), o "" si no se sabe."""
+    if os.name != "nt":
+        return ""
+    rc, lines = run_capture(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        timeout=30)
+    if rc != 0:
+        return ""
+    for line in lines:
+        texto = line.strip()
+        if texto.startswith('"') and '"' in texto[1:]:
+            return texto[1:texto.index('"', 1)]
+    return ""
+
+
 def stop(workdir: Optional[Path] = None, tree: bool = True) -> None:
     """Detiene el worker registrado en `worker.pid`.
+
+    Si no hay archivo de pid (lo arrancó un script o una tarea programada) se
+    busca quién escucha en el puerto gRPC y se mata **sólo** si es un python.
 
     `tree=False` lo mata solo a él, sin bajar por el árbol de procesos: el
     updater (`scripts/update_worker.py`) corre como hijo del worker y con
@@ -1030,13 +1075,24 @@ def stop(workdir: Optional[Path] = None, tree: bool = True) -> None:
     """
     workdir = (workdir or default_dir()).expanduser().resolve()
     pidf = _pid_file(workdir)
-    if not pidf.exists():
-        logger.info("sin worker registrado")
-        return
-    try:
-        pid = int(pidf.read_text(encoding="utf-8").strip())
-    except ValueError:
-        pid = 0
+    pid = 0
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pid = 0
+    else:
+        # Sin archivo de pid: se busca el dueño del puerto, pero sólo se mata
+        # si es un python (nunca un proceso ajeno que escuche ahí).
+        encontrado = port_pid() or 0
+        if not encontrado or "python" not in process_name(encontrado).lower():
+            logger.info("sin worker registrado")
+            return
+        logger.info(
+            "worker sin pid registrado: lo encontré escuchando en :%d (pid %d)",
+            GRPC_PORT, encontrado,
+        )
+        pid = encontrado
     if pid and _alive(pid):
         if os.name == "nt":
             cmd = ["taskkill", "/PID", str(pid), "/F"]

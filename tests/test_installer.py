@@ -861,6 +861,37 @@ def test_update_sin_worker_instalado_falla_claro(tmp_path):
         core.update(tmp_path)
 
 
+def test_stop_encuentra_el_worker_por_puerto(tmp_path, monkeypatch):
+    """Sin `worker.pid` (arrancado fuera del instalador) igual lo detiene."""
+    if os.name != "nt":
+        pytest.skip("netstat/taskkill son sólo Windows")
+    llamadas = []
+    monkeypatch.setattr(core, "port_pid", lambda port=core.GRPC_PORT: 777)
+    monkeypatch.setattr(core, "process_name", lambda pid: "python.exe")
+    monkeypatch.setattr(core, "_alive", lambda pid: True)
+    monkeypatch.setattr(core.subprocess, "run",
+                        lambda cmd, **kwargs: llamadas.append(cmd))
+
+    core.stop(tmp_path)
+
+    assert len(llamadas) == 1
+    assert "777" in llamadas[0]
+
+
+def test_stop_no_mata_un_proceso_ajeno_en_el_puerto(tmp_path, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("netstat/taskkill son sólo Windows")
+    llamadas = []
+    monkeypatch.setattr(core, "port_pid", lambda port=core.GRPC_PORT: 999)
+    monkeypatch.setattr(core, "process_name", lambda pid: "chrome.exe")
+    monkeypatch.setattr(core.subprocess, "run",
+                        lambda cmd, **kwargs: llamadas.append(cmd))
+
+    core.stop(tmp_path)
+
+    assert llamadas == []
+
+
 def test_detecta_intel_arc_para_el_torch_xpu(monkeypatch):
     """Sólo Arc / Iris Xe: las Intel UHD viejas no tienen backend XPU."""
     monkeypatch.setattr(
