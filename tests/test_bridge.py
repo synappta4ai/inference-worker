@@ -302,12 +302,18 @@ def test_client_heartbeat_update_queue(fake_back):
     assert res["requested_update"]["id"] == "u-1"
     assert FakeBack.heartbeats[-1]["completed_update"] == ""
 
+    assert FakeBack.heartbeats[-1]["failed_update"] is None
+
     FakeBack.requested_update = None
-    res2 = client.heartbeat(gpu_name="RTX", version="0.2.26",
+    res2 = client.heartbeat(gpu_name="RTX", version="0.2.27",
                             vram_free_mb=100, jobs_active=0, models=[],
-                            completed_update="u-1")
+                            completed_update="u-1", started_update="u-2",
+                            failed_update={"id": "u-0", "error": "timeout"})
     assert res2["requested_update"] is None
     assert FakeBack.heartbeats[-1]["completed_update"] == "u-1"
+    # El resultado del intento viaja explícitamente: el panel no lo adivina.
+    assert FakeBack.heartbeats[-1]["started_update"] == "u-2"
+    assert FakeBack.heartbeats[-1]["failed_update"] == {"id": "u-0", "error": "timeout"}
 
 
 # ─── Borrado de pesos en el agente ─────────────────────────────
@@ -320,6 +326,11 @@ def _agent(jobs_active: int = 0):
     ag = Agent(cfg, local_grpc="127.0.0.1:1")
     ag._jobs_active = jobs_active
     return ag
+
+
+def _snapshot():
+    return {"gpu_name": "RTX 4090", "vram_total_mb": 24576,
+            "vram_free_mb": 21000, "disk_free_mb": 90000, "models": []}
 
 
 def _stub_delete(monkeypatch, *, raises=None, registro=None):
@@ -472,8 +483,9 @@ def test_agent_launches_updater_and_defers_ack(monkeypatch, tmp_path):
     assert ag._stop.is_set()
     assert lanzado["cwd"] == str(tmp_path)
     assert lanzado["cmd"][1].endswith("update_worker.py")
-    assert lanzado["cmd"][-4:] == ["--url", "https://front/x.zip",
-                                  "--dir", str(tmp_path)]
+    assert lanzado["cmd"][2:6] == ["--url", "https://front/x.zip",
+                                  "--id", "u-1"]
+    assert lanzado["cmd"][-2:] == ["--dir", str(tmp_path)]
     ack = json.loads((tmp_path / agent_mod.UPDATE_ACK_FILE).read_text(encoding="utf-8"))
     assert ack["id"] == "u-1"
 
@@ -520,6 +532,100 @@ def test_agent_confirms_update_from_new_process(monkeypatch, tmp_path):
 
     assert capturado["completed_update"] == "u-9"
     assert not (tmp_path / agent_mod.UPDATE_ACK_FILE).exists()
+
+
+def test_agent_tells_back_it_started_the_update(monkeypatch, tmp_path):
+    """Antes de reiniciarse el agente manda `started_update`: el back sabe desde
+    cuándo esperar al proceso nuevo y el updater recibe el id del pedido para
+    poder reportar el fallo de ESE pedido."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    lanzado: dict = {}
+    monkeypatch.setattr(agent_mod, "spawn_detached",
+                        lambda cmd, cwd: lanzado.update(cmd=cmd))
+    monkeypatch.setattr(agent_mod, "gpu_snapshot", _snapshot)
+    capturado: dict = {}
+    ag = _agent()
+
+    class FakeClient:
+        def heartbeat(self, **kwargs):
+            capturado.update(kwargs)
+            return {}
+
+    ag.client = FakeClient()
+
+    assert ag._start_remote_update({"id": "u-1", "url": "https://front/x.zip"}) is True
+    assert capturado["started_update"] == "u-1"
+    assert "--id" in lanzado["cmd"] and "u-1" in lanzado["cmd"]
+
+
+def test_agent_reports_update_failure_written_by_updater(monkeypatch, tmp_path):
+    """El updater deja el motivo en disco; el agente lo manda en el heartbeat y
+    recién ahí lo borra. Es lo que reemplaza al reloj de 5 min del panel."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    (tmp_path / agent_mod.UPDATE_ERROR_FILE).write_text(
+        json.dumps({"id": "u-3", "error": "descarga falló: timeout"}),
+        encoding="utf-8")
+    monkeypatch.setattr(agent_mod, "gpu_snapshot", _snapshot)
+    capturado: dict = {}
+    ag = _agent()
+
+    class FakeClient:
+        def heartbeat(self, **kwargs):
+            capturado.update(kwargs)
+            ag._stop.set()
+            return {"cancel_task_ids": [], "requested_models": [],
+                    "requested_deletions": [], "requested_download_cancels": [],
+                    "requested_update": None}
+
+    ag.client = FakeClient()
+    ag._heartbeat_loop()
+
+    assert capturado["failed_update"] == {"id": "u-3",
+                                         "error": "descarga falló: timeout"}
+    assert not (tmp_path / agent_mod.UPDATE_ERROR_FILE).exists()
+
+
+def test_agent_reports_failure_when_updater_is_missing(monkeypatch, tmp_path):
+    """Sin updater no hay forma de aplicarla: se reporta el motivo en vez de
+    reintentar en cada latido para siempre."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    monkeypatch.setattr(agent_mod, "WORKER_ROOT", str(tmp_path))  # sin scripts/
+    ag = _agent()
+
+    assert ag._start_remote_update({"id": "u-4"}) is False
+    assert ag._pending_update_failure == {
+        "id": "u-4",
+        "error": "el updater no está en esta instalación (scripts/update_worker.py)",
+    }
+
+
+def test_update_worker_leaves_the_reason_for_the_agent(tmp_path):
+    """Si el updater no puede bajar el payload, deja `update-error.json` con el
+    id y el motivo: el agente lo reporta en su próximo heartbeat."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    # Proceso aparte, como corre de verdad: la URL no existe, así que falla la
+    # descarga y tiene que dejar el motivo en disco.
+    proc = subprocess.run(
+        [sys.executable, str(root / "scripts" / "update_worker.py"),
+         "--url", "http://127.0.0.1:1/synapta-worker.zip",
+         "--id", "u-7", "--dir", str(tmp_path)],
+        capture_output=True, timeout=180,
+    )
+
+    assert proc.returncode == 1
+    data = json.loads((tmp_path / "update-error.json").read_text(encoding="utf-8"))
+    assert data["id"] == "u-7"
+    assert "descarga falló" in data["error"]
 
 
 def test_agent_cancel_download_calls_local_grpc(monkeypatch):

@@ -60,6 +60,12 @@ WORKER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # mientras el worker baja el payload o reinstala dependencias.
 UPDATE_ACK_FILE = "update-ack.json"
 
+# Fallo de una actualización remota: lo escribe el updater con el motivo real
+# (descarga, hash, extracción, deps o arranque) y el agente lo manda en su
+# próximo heartbeat. El back lo guarda como `update_failure` y el panel muestra
+# por qué no se aplicó en vez de deducirlo de un reloj de 5 minutos.
+UPDATE_ERROR_FILE = "update-error.json"
+
 
 def _local_model_states() -> dict:
     """Estado real de pesos vía gRPC local (disponible/descargando/%).
@@ -180,6 +186,11 @@ def update_ack_path() -> str:
     return os.path.join(installed_workdir() or WORKER_ROOT, UPDATE_ACK_FILE)
 
 
+def update_error_path() -> str:
+    """Ruta del fallo pendiente de reportar de la última actualización."""
+    return os.path.join(installed_workdir() or WORKER_ROOT, UPDATE_ERROR_FILE)
+
+
 def spawn_detached(cmd: list, cwd: str) -> None:
     """Lanza el updater fuera de este proceso.
 
@@ -222,6 +233,8 @@ class Agent:
         # Actualización ya aplicada: el id quedó en disco y se confirma desde
         # este proceso nuevo en el primer heartbeat (el viejo se reinició).
         self._pending_update_ack = self._read_update_ack()
+        # Fallo que dejó el updater y todavía no viajó al back (None si no hay).
+        self._pending_update_failure = self._read_update_failure()
 
     # ─── ciclo de vida ──────────────────────────────────────────
 
@@ -279,20 +292,18 @@ class Agent:
         pending_delete_acks: list[str] = []
         pending_cancel_acks: list[str] = []
         while not self._stop.is_set():
-            snap = gpu_snapshot()
+            # El updater escribió el fallo en disco: si este proceso quedó vivo
+            # (falló antes de detenerlo) hay que enterarse igual.
+            if not self._pending_update_failure:
+                self._pending_update_failure = self._read_update_failure()
             try:
                 res = self.client.heartbeat(
-                    gpu_name=snap["gpu_name"],
-                    version=BRIDGE_VERSION,
-                    vram_total_mb=snap["vram_total_mb"],
-                    vram_free_mb=snap["vram_free_mb"],
-                    disk_free_mb=snap["disk_free_mb"],
-                    jobs_active=self._jobs_active,
-                    models=snap["models"],
+                    **self._heartbeat_payload(),
                     completed_downloads=pending_acks,
                     completed_deletions=pending_delete_acks,
                     completed_download_cancels=pending_cancel_acks,
                     completed_update=self._pending_update_ack,
+                    failed_update=self._pending_update_failure,
                 )
                 pending_acks = []
                 pending_delete_acks = []
@@ -301,6 +312,10 @@ class Agent:
                     # Ya viajó: el back sacó la actualización de la cola.
                     self._clear_update_ack()
                     self._pending_update_ack = ""
+                if self._pending_update_failure:
+                    # El back ya tiene el motivo: el panel deja de esperar.
+                    self._clear_update_failure()
+                    self._pending_update_failure = None
                 cancels = res.get("cancel_task_ids", [])
                 if isinstance(cancels, list):
                     for task_id in cancels:
@@ -456,6 +471,19 @@ class Agent:
 
     # ─── actualización remota ───────────────────────────────────
 
+    def _heartbeat_payload(self) -> dict:
+        """Estado vivo del worker: lo que no es el ack de un pedido."""
+        snap = gpu_snapshot()
+        return {
+            "gpu_name": snap["gpu_name"],
+            "version": BRIDGE_VERSION,
+            "vram_total_mb": snap["vram_total_mb"],
+            "vram_free_mb": snap["vram_free_mb"],
+            "disk_free_mb": snap["disk_free_mb"],
+            "jobs_active": self._jobs_active,
+            "models": snap["models"],
+        }
+
     def _read_update_ack(self) -> str:
         """Id de la actualización que este proceso nuevo tiene que confirmar."""
         try:
@@ -468,6 +496,24 @@ class Agent:
     def _clear_update_ack(self) -> None:
         try:
             os.remove(update_ack_path())
+        except OSError:
+            pass
+
+    def _read_update_failure(self) -> Optional[dict]:
+        """Fallo de la última actualización que dejó el updater (None si no hay)."""
+        try:
+            with open(update_error_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        request_id = str(data.get("id") or "")
+        if not request_id:
+            return None
+        return {"id": request_id, "error": str(data.get("error") or "")}
+
+    def _clear_update_failure(self) -> None:
+        try:
+            os.remove(update_error_path())
         except OSError:
             pass
 
@@ -489,16 +535,24 @@ class Agent:
                 self._jobs_active,
             )
             return False
+        request_id = str(requested.get("id") or "").strip()
+        url = str(requested.get("url") or "").strip()
         updater = os.path.join(WORKER_ROOT, "scripts", "update_worker.py")
         if not os.path.isfile(updater):
             logger.error("[bridge] no encuentro %s: no puedo actualizar", updater)
+            # Sin updater no hay forma de aplicarla: se reporta el motivo en vez
+            # de reintentar en cada latido para siempre.
+            self._pending_update_failure = {
+                "id": request_id,
+                "error": "el updater no está en esta instalación (scripts/update_worker.py)",
+            }
             return False
-        request_id = str(requested.get("id") or "").strip()
-        url = str(requested.get("url") or "").strip()
         workdir = installed_workdir()
         cmd = [sys.executable, updater]
         if url:
             cmd += ["--url", url]
+        if request_id:
+            cmd += ["--id", request_id]
         if workdir:
             cmd += ["--dir", workdir]
         try:
@@ -516,6 +570,15 @@ class Agent:
             return False
         logger.info("[bridge] actualización remota pedida: reinicio para aplicar %s",
                     url or "el payload publicado")
+        # Avisa que empieza a aplicarla: desde acá el worker deja de latir y el
+        # back puede esperar al proceso nuevo sin castigar con un reloj el rato
+        # que el agente esperó a que terminara un job.
+        try:
+            self.client.heartbeat(**self._heartbeat_payload(),
+                                   started_update=request_id)
+        except BridgeError as exc:
+            # Sin este aviso sólo se pierde el watchdog: la actualización sigue.
+            logger.warning("[bridge] no pude avisar que empiezo la actualización: %s", exc)
         self._stop.set()
         return True
 

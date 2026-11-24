@@ -69,4 +69,10 @@ Piezas:
 # `requested_update` del heartbeat, lanza el updater desacoplado (baja el
 # payload, se reinicia) y el proceso nuevo confirma con `completed_update`;
 # hasta entonces el panel muestra «Actualizando…».
-BRIDGE_VERSION = "0.2.26"
+# 0.2.27: la actualización reporta su resultado, no lo adivina el panel.
+# `started_update` avisa que el proceso empieza a reiniciarse y
+# `failed_update` lleva `{id, error}` con el motivo real: lo escribe el updater
+# (descarga, hash, extracción, deps, arranque) y el worker relanzado lo manda en
+# su primer heartbeat. Antes el back deducía el fallo de un reloj de 5 minutos,
+# que marcaba «falló» mientras el worker esperaba legítimamente un job largo.
+BRIDGE_VERSION = "0.2.27"

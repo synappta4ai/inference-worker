@@ -34,6 +34,10 @@ from core import (  # noqa: E402
 )
 
 STATE_FILE = "update-state.json"
+# Fallo que el agente manda al back en su próximo heartbeat (id + motivo), para
+# que el panel muestre por qué no se aplicó en vez de esperar «Actualizando…»
+# hasta que se le acabe el reloj.
+ERROR_FILE = "update-error.json"
 
 
 def say(msg: str) -> None:
@@ -63,6 +67,14 @@ def write_state(workdir: Path, data: dict) -> None:
     )
 
 
+def write_error(workdir: Path, request_id: str, url: str, msg: str) -> None:
+    """Deja el motivo del fallo para que el agente lo reporte al back."""
+    (workdir / ERROR_FILE).write_text(
+        json.dumps({"id": request_id, "url": url, "error": msg},
+                   ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def main() -> int:
     try:  # consola cp1252 de Windows: los acentos y "✓" no deben romper nada
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -73,15 +85,32 @@ def main() -> int:
     # cuando el panel no eligió una URL explícita.
     ap.add_argument("--url", default="")
     ap.add_argument("--sha256", default="")
+    # Id del pedido que encoló el panel: viaja en el reporte del fallo para que
+    # el back lo asocie a ESA actualización (y no a un reintento posterior).
+    ap.add_argument("--id", default="")
     ap.add_argument("--dir", default=None)
     args = ap.parse_args()
 
     workdir = (Path(args.dir) if args.dir else default_dir()).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
+    # Un intento nuevo supersede cualquier fallo viejo que no se haya reportado.
+    (workdir / ERROR_FILE).unlink(missing_ok=True)
+    stopped = False
 
     def fail(msg: str) -> int:
         write_state(workdir, {"status": "failed", "error": msg})
+        write_error(workdir, args.id, args.url or PAYLOAD_URL, msg)
         say(f"[x] {msg}")
+        # El worker es quien reporta al back: si ya lo habíamos detenido (falló
+        # la extracción, las deps o el arranque) lo relanzamos para que el
+        # próximo heartbeat lleve el motivo. Si ni así arranca, el back lo da
+        # por fallido con el watchdog del reinicio.
+        if stopped:
+            try:
+                start(workdir, require_clean=False)
+                say("worker relanzado tras el fallo")
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                say(f"[x] no pude relanzar el worker tras el fallo: {exc}")
         return 1
 
     tmp = workdir / "_update-download.zip"
@@ -102,6 +131,7 @@ def main() -> int:
         # Si el puerto no queda libre se aborta ANTES de extraer, en vez de
         # dejar archivos nuevos sobre un proceso que sigue con el código viejo.
         stop_for_update(workdir, tree=False)
+        stopped = True
     except Exception as exc:
         return fail(f"no pude detener el worker: {exc}")
 

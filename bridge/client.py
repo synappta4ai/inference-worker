@@ -140,7 +140,9 @@ class BridgeClient:
                   completed_deletions: Optional[list] = None,
                   completed_download_cancels: Optional[list] = None,
                   vram_total_mb: int = 0,
-                  completed_update: str = "") -> dict:
+                  completed_update: str = "",
+                  started_update: str = "",
+                  failed_update: Optional[dict] = None) -> dict:
         """Refresh del estado vivo.
 
         Devuelve {"cancel_task_ids", "requested_models", "requested_deletions",
@@ -154,6 +156,11 @@ class BridgeClient:
 
         `vram_total_mb` viaja en cada latido (no sólo al emparejar): es lo que
         el panel usa para «Memoria» y la columna «En tu GPU».
+
+        `started_update` avisa que este proceso empieza a reiniciarse para
+        aplicarla (el back sabe desde cuándo esperar) y `failed_update` lleva
+        `{id, error}` con el motivo real del fallo, así el panel lo muestra en
+        vez de deducirlo de un reloj.
         """
         data = self._request("POST", "/api/v1/internal/workers/heartbeat", {
             "gpu_name": gpu_name,
@@ -167,6 +174,8 @@ class BridgeClient:
             "completed_deletions": list(completed_deletions or []),
             "completed_download_cancels": list(completed_download_cancels or []),
             "completed_update": str(completed_update or ""),
+            "started_update": str(started_update or ""),
+            "failed_update": failed_update if isinstance(failed_update, dict) else None,
         })
         if not isinstance(data, dict):
             return {"cancel_task_ids": [], "requested_models": [],
