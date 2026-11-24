@@ -48,4 +48,7 @@ Piezas:
 # 0.2.19: arreglado el auto-update: `stop(tree=False)` porque el updater es hijo
 # del worker y el `taskkill /T` lo mataba a mitad de camino, y sus prints ya no
 # revientan con UnicodeEncodeError en consolas cp1252.
-BRIDGE_VERSION = "0.2.19"
+# 0.2.20: el worker ya no asume CUDA: `device.py` elige CUDA/XPU/CPU con su
+# VRAM y su precisión (fp16 en Arc, fp32 en CPU), y el instalador baja el torch
+# XPU cuando detecta una Intel Arc.
+BRIDGE_VERSION = "0.2.20"
