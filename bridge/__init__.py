@@ -58,4 +58,8 @@ Piezas:
 # 0.2.23: la actualización ya no da por buena una versión si el proceso viejo
 # sigue escuchando en :50051 (worker sin worker.pid): verifica el puerto y
 # aborta antes de reemplazar archivos, o arranca y confirma el pid nuevo.
-BRIDGE_VERSION = "0.2.23"
+# 0.2.24: el agente atiende `requested_download_cancels` del heartbeat: aborta
+# la descarga en curso (DownloadModel cancel=true) y descarta los bytes
+# parciales, así elegir el modelo equivocado en una GPU emparejada ya no obliga
+# a esperar la descarga entera. Confirma con `completed_download_cancels`.
+BRIDGE_VERSION = "0.2.24"
