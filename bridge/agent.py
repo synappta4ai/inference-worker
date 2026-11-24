@@ -234,6 +234,7 @@ class Agent:
                 res = self.client.heartbeat(
                     gpu_name=snap["gpu_name"],
                     version=BRIDGE_VERSION,
+                    vram_total_mb=snap["vram_total_mb"],
                     vram_free_mb=snap["vram_free_mb"],
                     disk_free_mb=snap["disk_free_mb"],
                     jobs_active=self._jobs_active,

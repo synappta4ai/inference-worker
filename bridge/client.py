@@ -138,7 +138,8 @@ class BridgeClient:
                   completed_downloads: Optional[list] = None,
                   disk_free_mb: int = 0,
                   completed_deletions: Optional[list] = None,
-                  completed_download_cancels: Optional[list] = None) -> dict:
+                  completed_download_cancels: Optional[list] = None,
+                  vram_total_mb: int = 0) -> dict:
         """Refresh del estado vivo.
 
         Devuelve {"cancel_task_ids", "requested_models", "requested_deletions",
@@ -146,10 +147,14 @@ class BridgeClient:
         de gestión de pesos que el admin hizo desde el panel. El agente los
         ejecuta contra el gRPC local y los confirma con completed_downloads /
         completed_deletions / completed_download_cancels en el próximo heartbeat.
+
+        `vram_total_mb` viaja en cada latido (no sólo al emparejar): es lo que
+        el panel usa para «Memoria» y la columna «En tu GPU».
         """
         data = self._request("POST", "/api/v1/internal/workers/heartbeat", {
             "gpu_name": gpu_name,
             "version": version,
+            "vram_total_mb": int(vram_total_mb or 0),
             "vram_free_mb": vram_free_mb,
             "disk_free_mb": disk_free_mb,
             "jobs_active": jobs_active,

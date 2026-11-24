@@ -226,6 +226,15 @@ def test_client_heartbeat_returns_cancels(fake_back):
     assert FakeBack.heartbeats[-1]["gpu_name"] == "RTX"
 
 
+def test_client_heartbeat_reports_total_vram(fake_back):
+    """«Memoria» y la columna «En tu GPU» del panel salen de la VRAM total: el
+    agente la manda en cada heartbeat, no sólo al emparejar."""
+    client = BridgeClient(fake_back, token="tok-secret")
+    client.heartbeat(gpu_name="RTX 4090", version="0.2.25", vram_total_mb=24564,
+                     vram_free_mb=23000, jobs_active=0, models=[])
+    assert FakeBack.heartbeats[-1]["vram_total_mb"] == 24564
+
+
 def test_client_heartbeat_download_queue(fake_back):
     """El panel encola descargas: viajan como requested_models y el
     agente las confirma con completed_downloads en el próximo latido."""
@@ -397,6 +406,32 @@ def _stub_download(monkeypatch, *, raises=None, registro=None):
                         lambda target: contextlib.nullcontext(object()))
     monkeypatch.setattr(agent_mod.inference_pb2_grpc, "InferenceServiceStub", Stub)
     return agent_mod
+
+
+def test_agent_heartbeat_sends_total_vram(monkeypatch):
+    """El loop de heartbeat reenvía la VRAM total del snapshot de la GPU."""
+    from bridge import agent as agent_mod
+
+    ag = _agent()
+    capturado: dict = {}
+
+    def snapshot():
+        return {"gpu_name": "RTX 4090", "vram_total_mb": 24576,
+                "vram_free_mb": 21000, "disk_free_mb": 90000, "models": []}
+
+    class FakeClient:
+        def heartbeat(self, **kwargs):
+            capturado.update(kwargs)
+            ag._stop.set()  # una sola vuelta del loop
+            return {"cancel_task_ids": [], "requested_models": [],
+                    "requested_deletions": [], "requested_download_cancels": []}
+
+    monkeypatch.setattr(agent_mod, "gpu_snapshot", snapshot)
+    ag.client = FakeClient()
+    ag._heartbeat_loop()
+
+    assert capturado["vram_total_mb"] == 24576
+    assert capturado["vram_free_mb"] == 21000
 
 
 def test_agent_cancel_download_calls_local_grpc(monkeypatch):
