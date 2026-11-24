@@ -139,14 +139,18 @@ class BridgeClient:
                   disk_free_mb: int = 0,
                   completed_deletions: Optional[list] = None,
                   completed_download_cancels: Optional[list] = None,
-                  vram_total_mb: int = 0) -> dict:
+                  vram_total_mb: int = 0,
+                  completed_update: str = "") -> dict:
         """Refresh del estado vivo.
 
         Devuelve {"cancel_task_ids", "requested_models", "requested_deletions",
-        "requested_download_cancels"}: cancelaciones de jobs en curso + pedidos
-        de gestión de pesos que el admin hizo desde el panel. El agente los
-        ejecuta contra el gRPC local y los confirma con completed_downloads /
-        completed_deletions / completed_download_cancels en el próximo heartbeat.
+        "requested_download_cancels", "requested_update"}: cancelaciones de
+        jobs en curso + pedidos de gestión de pesos y actualización que el
+        admin hizo desde el panel. El agente los ejecuta contra el gRPC local y
+        los confirma con completed_downloads / completed_deletions /
+        completed_download_cancels en el próximo heartbeat; la actualización se
+        confirma desde el proceso nuevo (completed_update), porque el viejo se
+        reinicia para aplicarla.
 
         `vram_total_mb` viaja en cada latido (no sólo al emparejar): es lo que
         el panel usa para «Memoria» y la columna «En tu GPU».
@@ -162,14 +166,17 @@ class BridgeClient:
             "completed_downloads": list(completed_downloads or []),
             "completed_deletions": list(completed_deletions or []),
             "completed_download_cancels": list(completed_download_cancels or []),
+            "completed_update": str(completed_update or ""),
         })
         if not isinstance(data, dict):
             return {"cancel_task_ids": [], "requested_models": [],
-                    "requested_deletions": [], "requested_download_cancels": []}
+                    "requested_deletions": [], "requested_download_cancels": [],
+                    "requested_update": None}
         cancels = data.get("cancel_task_ids")
         requested = data.get("requested_models")
         deletions = data.get("requested_deletions")
         download_cancels = data.get("requested_download_cancels")
+        update = data.get("requested_update")
         return {
             "cancel_task_ids": list(cancels) if isinstance(cancels, list) else [],
             "requested_models": list(requested) if isinstance(requested, list) else [],
@@ -177,6 +184,7 @@ class BridgeClient:
             "requested_download_cancels": (
                 list(download_cancels) if isinstance(download_cancels, list) else []
             ),
+            "requested_update": update if isinstance(update, dict) else None,
         }
 
     def claim(self, wait_seconds: int = 25) -> Optional[Job]:

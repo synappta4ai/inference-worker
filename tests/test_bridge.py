@@ -31,6 +31,7 @@ class FakeBack(BaseHTTPRequestHandler):
     requested_models: list = []
     requested_deletions: list = []
     requested_download_cancels: list = []
+    requested_update: dict | None = None
     claimed_job: dict | None = None
     # True = el claim devuelve el job pelado en `data` (forma de backs viejos).
     bare_job = False
@@ -69,7 +70,8 @@ class FakeBack(BaseHTTPRequestHandler):
                 "cancel_task_ids": self.cancel_ids,
                 "requested_models": self.requested_models,
                 "requested_deletions": self.requested_deletions,
-                "requested_download_cancels": self.requested_download_cancels}})
+                "requested_download_cancels": self.requested_download_cancels,
+                "requested_update": self.requested_update}})
         if self.path.startswith("/api/v1/internal/workers/claim"):
             job = self.claimed_job
             self.claimed_job = None  # solo una entrega
@@ -107,6 +109,7 @@ def fake_back():
     FakeBack.requested_models = []
     FakeBack.requested_deletions = []
     FakeBack.requested_download_cancels = []
+    FakeBack.requested_update = None
     FakeBack.revoked = False
     server = HTTPServer(("127.0.0.1", 0), FakeBack)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -289,6 +292,24 @@ def test_client_heartbeat_download_cancel_queue(fake_back):
     assert FakeBack.heartbeats[-1]["completed_download_cancels"] == ["FLUX.1-dev"]
 
 
+def test_client_heartbeat_update_queue(fake_back):
+    """El panel pide actualizar el worker: viaja como requested_update y el
+    proceso nuevo lo confirma con completed_update (el viejo se reinicia)."""
+    FakeBack.requested_update = {"id": "u-1", "url": "https://front/x.zip"}
+    client = BridgeClient(fake_back, token="tok-secret")
+    res = client.heartbeat(gpu_name="RTX", version="0.2.25",
+                           vram_free_mb=100, jobs_active=0, models=[])
+    assert res["requested_update"]["id"] == "u-1"
+    assert FakeBack.heartbeats[-1]["completed_update"] == ""
+
+    FakeBack.requested_update = None
+    res2 = client.heartbeat(gpu_name="RTX", version="0.2.26",
+                            vram_free_mb=100, jobs_active=0, models=[],
+                            completed_update="u-1")
+    assert res2["requested_update"] is None
+    assert FakeBack.heartbeats[-1]["completed_update"] == "u-1"
+
+
 # ─── Borrado de pesos en el agente ─────────────────────────────
 
 def _agent(jobs_active: int = 0):
@@ -432,6 +453,73 @@ def test_agent_heartbeat_sends_total_vram(monkeypatch):
 
     assert capturado["vram_total_mb"] == 24576
     assert capturado["vram_free_mb"] == 21000
+
+
+# ─── Actualización remota en el agente ────────────────────────
+
+def test_agent_launches_updater_and_defers_ack(monkeypatch, tmp_path):
+    """El agente lanza el updater desacoplado, deja el ack para el proceso
+    nuevo y frena: no confirma una actualización que todavía no arrancó."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    lanzado: dict = {}
+    monkeypatch.setattr(agent_mod, "spawn_detached",
+                        lambda cmd, cwd: lanzado.update(cmd=cmd, cwd=cwd))
+    ag = _agent()
+
+    assert ag._start_remote_update({"id": "u-1", "url": "https://front/x.zip"}) is True
+    assert ag._stop.is_set()
+    assert lanzado["cwd"] == str(tmp_path)
+    assert lanzado["cmd"][1].endswith("update_worker.py")
+    assert lanzado["cmd"][-4:] == ["--url", "https://front/x.zip",
+                                  "--dir", str(tmp_path)]
+    ack = json.loads((tmp_path / agent_mod.UPDATE_ACK_FILE).read_text(encoding="utf-8"))
+    assert ack["id"] == "u-1"
+
+
+def test_agent_update_waits_for_running_job(monkeypatch):
+    """Reiniciar con un job a medio generar lo perdería: el pedido espera."""
+    from bridge import agent as agent_mod
+
+    def no_lanzar(*_a, **_k):
+        raise AssertionError("no debe reiniciar con un job activo")
+
+    monkeypatch.setattr(agent_mod, "spawn_detached", no_lanzar)
+    ag = _agent(jobs_active=1)
+
+    assert ag._start_remote_update({"id": "u-1"}) is False
+
+
+def test_agent_confirms_update_from_new_process(monkeypatch, tmp_path):
+    """El worker reiniciado manda completed_update en su primer heartbeat y
+    borra el ack: recién ahí el panel deja de mostrar «Actualizando…»."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    (tmp_path / agent_mod.UPDATE_ACK_FILE).write_text(
+        json.dumps({"id": "u-9"}), encoding="utf-8")
+    ag = _agent()
+    capturado: dict = {}
+
+    def snapshot():
+        return {"gpu_name": "RTX 4090", "vram_total_mb": 24576,
+                "vram_free_mb": 21000, "disk_free_mb": 90000, "models": []}
+
+    class FakeClient:
+        def heartbeat(self, **kwargs):
+            capturado.update(kwargs)
+            ag._stop.set()
+            return {"cancel_task_ids": [], "requested_models": [],
+                    "requested_deletions": [], "requested_download_cancels": [],
+                    "requested_update": None}
+
+    monkeypatch.setattr(agent_mod, "gpu_snapshot", snapshot)
+    ag.client = FakeClient()
+    ag._heartbeat_loop()
+
+    assert capturado["completed_update"] == "u-9"
+    assert not (tmp_path / agent_mod.UPDATE_ACK_FILE).exists()
 
 
 def test_agent_cancel_download_calls_local_grpc(monkeypatch):

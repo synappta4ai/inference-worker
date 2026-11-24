@@ -26,6 +26,7 @@ from core import (  # noqa: E402
     ensure_python,
     extract_payload,
     install_deps,
+    PAYLOAD_URL,
     run_doctor,
     start,
     stop_for_update,
@@ -68,7 +69,9 @@ def main() -> int:
     except Exception:  # noqa: BLE001 — stdout puede no existir
         pass
     ap = argparse.ArgumentParser(prog="update_worker")
-    ap.add_argument("--url", required=True)
+    # Sin --url se usa el payload publicado: así lo puede lanzar el agente
+    # cuando el panel no eligió una URL explícita.
+    ap.add_argument("--url", default="")
     ap.add_argument("--sha256", default="")
     ap.add_argument("--dir", default=None)
     args = ap.parse_args()
@@ -83,7 +86,7 @@ def main() -> int:
 
     tmp = workdir / "_update-download.zip"
     try:
-        download_payload(args.url, tmp)
+        download_payload(args.url or PAYLOAD_URL, tmp)
     except Exception as exc:
         return fail(f"descarga falló: {exc}")
 

@@ -20,10 +20,13 @@ subida al arrancar (nunca se pierde trabajo por internet).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
 import socket
+import subprocess
+import sys
 import threading
 import time
 from typing import Optional
@@ -50,6 +53,12 @@ LOCAL_GRPC = "127.0.0.1:50051"
 # Raíz del worker (el directorio del repo/payload), para resolver rutas
 # relativas sin depender de desde dónde se arrancó run.py.
 WORKER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Archivo que deja el agente antes de reiniciarse por una actualización remota:
+# el proceso nuevo lo lee y confirma el pedido en su primer heartbeat. El back
+# limpia la cola recién ahí, así el panel sigue mostrando «Actualizando…»
+# mientras el worker baja el payload o reinstala dependencias.
+UPDATE_ACK_FILE = "update-ack.json"
 
 
 def _local_model_states() -> dict:
@@ -152,6 +161,44 @@ def gpu_snapshot() -> dict:
     }
 
 
+def installed_workdir() -> Optional[str]:
+    """Directorio de instalación (padre de `worker/`), o None si no lo es.
+
+    El instalador deja el código en `<workdir>/worker` y el Python, el pid y
+    los logs en `<workdir>`: el updater necesita ese directorio para detener el
+    proceso vivo y relanzar el nuevo. Corriendo desde el repo no hay una
+    instalación que actualizar, así que se usa el directorio del worker.
+    """
+    parent = os.path.dirname(WORKER_ROOT)
+    if os.path.basename(WORKER_ROOT).lower() == "worker":
+        return parent
+    return None
+
+
+def update_ack_path() -> str:
+    """Ruta del ack pendiente de la última actualización aplicada."""
+    return os.path.join(installed_workdir() or WORKER_ROOT, UPDATE_ACK_FILE)
+
+
+def spawn_detached(cmd: list, cwd: str) -> None:
+    """Lanza el updater fuera de este proceso.
+
+    Tiene que sobrevivir a este worker: el updater lo detiene y lo relanza, así
+    que un Popen normal moriría con él a mitad de la actualización. La salida
+    va a `update.log` porque el proceso corre sin consola.
+    """
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kwargs["start_new_session"] = True
+    with open(os.path.join(cwd, "update.log"), "ab") as log:
+        subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=subprocess.STDOUT,
+                         close_fds=True, **kwargs)
+
+
 def machine_name() -> str:
     """Nombre legible para el panel admin: host + OS."""
     return f"{socket.gethostname()} ({platform.system()})"
@@ -172,6 +219,9 @@ class Agent:
         # Borrados ya avisados: evita repetir el mismo warning cada 20 s
         # mientras el pedido sigue pendiente (descarga en curso, job activo).
         self._delete_warned: set[str] = set()
+        # Actualización ya aplicada: el id quedó en disco y se confirma desde
+        # este proceso nuevo en el primer heartbeat (el viejo se reinició).
+        self._pending_update_ack = self._read_update_ack()
 
     # ─── ciclo de vida ──────────────────────────────────────────
 
@@ -242,10 +292,15 @@ class Agent:
                     completed_downloads=pending_acks,
                     completed_deletions=pending_delete_acks,
                     completed_download_cancels=pending_cancel_acks,
+                    completed_update=self._pending_update_ack,
                 )
                 pending_acks = []
                 pending_delete_acks = []
                 pending_cancel_acks = []
+                if self._pending_update_ack:
+                    # Ya viajó: el back sacó la actualización de la cola.
+                    self._clear_update_ack()
+                    self._pending_update_ack = ""
                 cancels = res.get("cancel_task_ids", [])
                 if isinstance(cancels, list):
                     for task_id in cancels:
@@ -267,6 +322,11 @@ class Agent:
                     for key in deletions:
                         if self._start_remote_delete(str(key)):
                             pending_delete_acks.append(str(key))
+                # Última: reinicia el worker, así que no deja nada más por
+                # hacer en este latido.
+                update = res.get("requested_update")
+                if isinstance(update, dict):
+                    self._start_remote_update(update)
             except BridgeError as exc:
                 # Token revocado → el admin desemparejó la GPU: parar.
                 if exc.status == 401:
@@ -393,6 +453,71 @@ class Agent:
                     key, name, exc.details() if hasattr(exc, "details") else exc,
                 )
             return False
+
+    # ─── actualización remota ───────────────────────────────────
+
+    def _read_update_ack(self) -> str:
+        """Id de la actualización que este proceso nuevo tiene que confirmar."""
+        try:
+            with open(update_ack_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return ""
+        return str(data.get("id") or "")
+
+    def _clear_update_ack(self) -> None:
+        try:
+            os.remove(update_ack_path())
+        except OSError:
+            pass
+
+    def _start_remote_update(self, requested: dict) -> bool:
+        """Aplica una actualización pedida desde el panel.
+
+        Lanza `scripts/update_worker.py` desacoplado: ese proceso espera a que
+        termine el trabajo en curso, detiene este worker, reemplaza el código y
+        lo vuelve a arrancar. El pedido NO se confirma acá — este proceso muere
+        en el reinicio: el id queda en UPDATE_ACK_FILE y el worker nuevo lo
+        manda en su primer heartbeat, cuando ya está vivo con la versión nueva.
+
+        Devuelve False si todavía no corresponde (job en curso, updater
+        ausente): el back lo reintenta en el próximo latido.
+        """
+        if self._jobs_active > 0:
+            logger.info(
+                "[bridge] actualización en espera: hay %d job(s) en curso",
+                self._jobs_active,
+            )
+            return False
+        updater = os.path.join(WORKER_ROOT, "scripts", "update_worker.py")
+        if not os.path.isfile(updater):
+            logger.error("[bridge] no encuentro %s: no puedo actualizar", updater)
+            return False
+        request_id = str(requested.get("id") or "").strip()
+        url = str(requested.get("url") or "").strip()
+        workdir = installed_workdir()
+        cmd = [sys.executable, updater]
+        if url:
+            cmd += ["--url", url]
+        if workdir:
+            cmd += ["--dir", workdir]
+        try:
+            with open(update_ack_path(), "w", encoding="utf-8") as fh:
+                json.dump({"id": request_id, "url": url}, fh)
+        except OSError as exc:
+            logger.warning("[bridge] no pude anotar el ack de la actualización: %s", exc)
+        try:
+            spawn_detached(cmd, workdir or WORKER_ROOT)
+        except OSError as exc:
+            logger.error("[bridge] no pude lanzar la actualización: %s", exc)
+            # Sin updater no hay reinicio: que el back lo reintente, no que dé
+            # por aplicada una actualización que nunca corrió.
+            self._clear_update_ack()
+            return False
+        logger.info("[bridge] actualización remota pedida: reinicio para aplicar %s",
+                    url or "el payload publicado")
+        self._stop.set()
+        return True
 
     def _cancel_local(self, task_id: str) -> None:
         """Pide al gRPC local abortar el job en curso (si es este agente)."""
