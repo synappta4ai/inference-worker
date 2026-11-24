@@ -45,4 +45,7 @@ Piezas:
 # así que esos dos fallaban al cargar y solo ensuciaban la lista.
 # 0.2.18: el payload vuelve a incluir `installer/` (el auto-update del worker
 # moría con ImportError) y el instalador suma ventana de modelos y actualización.
-BRIDGE_VERSION = "0.2.18"
+# 0.2.19: arreglado el auto-update: `stop(tree=False)` porque el updater es hijo
+# del worker y el `taskkill /T` lo mataba a mitad de camino, y sus prints ya no
+# revientan con UnicodeEncodeError en consolas cp1252.
+BRIDGE_VERSION = "0.2.19"
