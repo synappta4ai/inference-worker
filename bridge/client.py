@@ -6,6 +6,7 @@ de Fase A (back: internal/modules/workerbridge):
 
     POST /api/v1/internal/workers/register    (code → token, una sola vez)
     POST /api/v1/internal/workers/heartbeat   (X-Worker-Token) → cancelaciones
+                                                 + descargas/borrados pedidos
     POST /api/v1/internal/workers/claim?wait= (long-poll de la cola)
     POST /api/v1/internal/workers/report      (progreso / failed / cancelled)
     POST /api/v1/internal/workers/artifacts   (multipart del output)
@@ -134,13 +135,15 @@ class BridgeClient:
     def heartbeat(self, gpu_name: str, version: str, vram_free_mb: int,
                   jobs_active: int, models: list,
                   completed_downloads: Optional[list] = None,
-                  disk_free_mb: int = 0) -> dict:
+                  disk_free_mb: int = 0,
+                  completed_deletions: Optional[list] = None) -> dict:
         """Refresh del estado vivo.
 
-        Devuelve {"cancel_task_ids": [...], "requested_models": [...]}:
-        cancelaciones de jobs en curso + descargas que el admin pidió
-        desde el panel (el agente las dispara contra el gRPC local y las
-        confirma con completed_downloads en el próximo heartbeat).
+        Devuelve {"cancel_task_ids", "requested_models", "requested_deletions"}:
+        cancelaciones de jobs en curso + pedidos de gestión de pesos que el
+        admin hizo desde el panel. El agente los ejecuta contra el gRPC local y
+        los confirma con completed_downloads / completed_deletions en el
+        próximo heartbeat.
         """
         data = self._request("POST", "/api/v1/internal/workers/heartbeat", {
             "gpu_name": gpu_name,
@@ -150,14 +153,18 @@ class BridgeClient:
             "jobs_active": jobs_active,
             "models": models,
             "completed_downloads": list(completed_downloads or []),
+            "completed_deletions": list(completed_deletions or []),
         })
         if not isinstance(data, dict):
-            return {"cancel_task_ids": [], "requested_models": []}
+            return {"cancel_task_ids": [], "requested_models": [],
+                    "requested_deletions": []}
         cancels = data.get("cancel_task_ids")
         requested = data.get("requested_models")
+        deletions = data.get("requested_deletions")
         return {
             "cancel_task_ids": list(cancels) if isinstance(cancels, list) else [],
             "requested_models": list(requested) if isinstance(requested, list) else [],
+            "requested_deletions": list(deletions) if isinstance(deletions, list) else [],
         }
 
     def claim(self, wait_seconds: int = 25) -> Optional[Job]:

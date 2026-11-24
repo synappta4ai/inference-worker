@@ -29,6 +29,7 @@ class FakeBack(BaseHTTPRequestHandler):
     heartbeats: list = []
     cancel_ids: list = []
     requested_models: list = []
+    requested_deletions: list = []
     claimed_job: dict | None = None
     # True = el claim devuelve el job pelado en `data` (forma de backs viejos).
     bare_job = False
@@ -65,7 +66,8 @@ class FakeBack(BaseHTTPRequestHandler):
             self.heartbeats.append(json.loads(raw or b"{}"))
             return self._json(200, {"success": True, "data": {
                 "cancel_task_ids": self.cancel_ids,
-                "requested_models": self.requested_models}})
+                "requested_models": self.requested_models,
+                "requested_deletions": self.requested_deletions}})
         if self.path.startswith("/api/v1/internal/workers/claim"):
             job = self.claimed_job
             self.claimed_job = None  # solo una entrega
@@ -101,6 +103,7 @@ def fake_back():
     FakeBack.cancel_ids, FakeBack.claimed_job = [], None
     FakeBack.bare_job = False
     FakeBack.requested_models = []
+    FakeBack.requested_deletions = []
     FakeBack.revoked = False
     server = HTTPServer(("127.0.0.1", 0), FakeBack)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -236,6 +239,120 @@ def test_client_heartbeat_download_queue(fake_back):
                             completed_downloads=["FLUX.1-dev"])
     assert res2["requested_models"] == []
     assert FakeBack.heartbeats[-1]["completed_downloads"] == ["FLUX.1-dev"]
+
+
+def test_client_heartbeat_deletion_queue(fake_back):
+    """El panel pide liberar disco: viaja como requested_deletions y el agente
+    lo confirma con completed_deletions en el latido siguiente."""
+    FakeBack.requested_deletions = ["SDXL-Turbo"]
+    client = BridgeClient(fake_back, token="tok-secret")
+    res = client.heartbeat(gpu_name="RTX", version="0.2.22",
+                           vram_free_mb=100, jobs_active=0, models=[])
+    assert res["requested_deletions"] == ["SDXL-Turbo"]
+    assert FakeBack.heartbeats[-1].get("completed_deletions", []) == []
+
+    FakeBack.requested_deletions = []
+    res2 = client.heartbeat(gpu_name="RTX", version="0.2.22",
+                            vram_free_mb=100, jobs_active=0, models=[],
+                            completed_deletions=["SDXL-Turbo"])
+    assert res2["requested_deletions"] == []
+    assert FakeBack.heartbeats[-1]["completed_deletions"] == ["SDXL-Turbo"]
+
+
+# ─── Borrado de pesos en el agente ─────────────────────────────
+
+def _agent(jobs_active: int = 0):
+    from bridge.agent import Agent  # importa grpc/pb: sólo cuando hace falta
+
+    cfg = config.BridgeConfig(back_url="http://127.0.0.1:1", worker_id="w-1",
+                              token="t", worker_name="pc")
+    ag = Agent(cfg, local_grpc="127.0.0.1:1")
+    ag._jobs_active = jobs_active
+    return ag
+
+
+def _stub_delete(monkeypatch, *, raises=None, registro=None):
+    """Reemplaza el canal gRPC local y el stub que usa el agente."""
+    import contextlib
+
+    from bridge import agent as agent_mod
+
+    class Stub:
+        def __init__(self, _channel):
+            pass
+
+        def DeleteModel(self, req, timeout=None):  # noqa: N802 — nombre del proto
+            if registro is not None:
+                registro.append(req.key)
+            if raises is not None:
+                raise raises
+            return object()
+
+    monkeypatch.setattr(agent_mod.grpc, "insecure_channel",
+                        lambda target: contextlib.nullcontext(object()))
+    monkeypatch.setattr(agent_mod.inference_pb2_grpc, "InferenceServiceStub", Stub)
+    return agent_mod
+
+
+def test_agent_delete_calls_local_grpc(monkeypatch):
+    llamadas: list[str] = []
+    _stub_delete(monkeypatch, registro=llamadas)
+    ag = _agent()
+
+    assert ag._start_remote_delete("SDXL-Turbo") is True
+    assert llamadas == ["SDXL-Turbo"]
+
+
+def test_agent_delete_waits_while_generating(monkeypatch):
+    """Borrar los pesos de un pipeline en uso puede fallar y no libera disco:
+    el pedido espera (sin ack) a que termine la generación."""
+    agent_mod = _stub_delete(monkeypatch)
+
+    def no_llamar(_target):
+        raise AssertionError("no debe tocar el gRPC con un job activo")
+
+    monkeypatch.setattr(agent_mod.grpc, "insecure_channel", no_llamar)
+    ag = _agent(jobs_active=1)
+
+    assert ag._start_remote_delete("SDXL-Turbo") is False
+
+
+def test_agent_delete_retries_when_download_is_running(monkeypatch):
+    """Una descarga en curso rechaza el borrado (FAILED_PRECONDITION): no se
+    hace ack, el back reintenta y el pedido no se pierde."""
+    agent_mod = _stub_delete(monkeypatch)
+
+    class Condicion(agent_mod.grpc.RpcError):
+        def code(self):
+            return agent_mod.grpc.StatusCode.FAILED_PRECONDITION
+
+        def details(self):
+            return "cancelá la descarga antes de borrar el modelo"
+
+    _stub_delete(monkeypatch, raises=Condicion())
+    ag = _agent()
+
+    assert ag._start_remote_delete("SDXL-Turbo") is False
+    # El mismo aviso no se repite en cada latido (20 s).
+    assert ag._start_remote_delete("SDXL-Turbo") is False
+    assert "SDXL-Turbo" in ag._delete_warned
+
+
+def test_agent_delete_acks_unknown_key(monkeypatch):
+    """Una clave que este worker no conoce no se reintenta para siempre."""
+    agent_mod = _stub_delete(monkeypatch)
+
+    class NoExiste(agent_mod.grpc.RpcError):
+        def code(self):
+            return agent_mod.grpc.StatusCode.NOT_FOUND
+
+        def details(self):
+            return "modelo desconocido"
+
+    _stub_delete(monkeypatch, raises=NoExiste())
+    ag = _agent()
+
+    assert ag._start_remote_delete("Fantasma") is True
 
 
 def test_client_heartbeat_rejects_bad_token(fake_back):

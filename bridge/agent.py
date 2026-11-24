@@ -169,6 +169,9 @@ class Agent:
         # task_id → grpc call handle para cancelaciones que llegan por heartbeat.
         self._cancel_lock = threading.Lock()
         self._active_calls: dict = {}
+        # Borrados ya avisados: evita repetir el mismo warning cada 20 s
+        # mientras el pedido sigue pendiente (descarga en curso, job activo).
+        self._delete_warned: set[str] = set()
 
     # ─── ciclo de vida ──────────────────────────────────────────
 
@@ -223,6 +226,7 @@ class Agent:
         # Descargas pedidas desde el panel ya tomadas: se confirman (ack)
         # en el próximo heartbeat para sacarlas de la cola del back.
         pending_acks: list[str] = []
+        pending_delete_acks: list[str] = []
         while not self._stop.is_set():
             snap = gpu_snapshot()
             try:
@@ -234,8 +238,10 @@ class Agent:
                     jobs_active=self._jobs_active,
                     models=snap["models"],
                     completed_downloads=pending_acks,
+                    completed_deletions=pending_delete_acks,
                 )
                 pending_acks = []
+                pending_delete_acks = []
                 cancels = res.get("cancel_task_ids", [])
                 if isinstance(cancels, list):
                     for task_id in cancels:
@@ -245,6 +251,11 @@ class Agent:
                     for key in requested:
                         if self._start_remote_download(str(key)):
                             pending_acks.append(str(key))
+                deletions = res.get("requested_deletions", [])
+                if isinstance(deletions, list):
+                    for key in deletions:
+                        if self._start_remote_delete(str(key)):
+                            pending_delete_acks.append(str(key))
             except BridgeError as exc:
                 # Token revocado → el admin desemparejó la GPU: parar.
                 if exc.status == 401:
@@ -283,6 +294,57 @@ class Agent:
                                key, name, exc.details() if hasattr(exc, "details") else exc)
                 return True
             logger.warning("[bridge] descarga %s no lanzada, reintento luego: %s", key, exc)
+            return False
+
+    def _start_remote_delete(self, key: str) -> bool:
+        """Borra los pesos en el gRPC local (liberar disco pedido desde el panel).
+
+        Devuelve True si el back puede darlo por tomado: el modelo ya no está
+        en disco (borrado ahora, o no tenía pesos). False = NO se hace ack y el
+        back lo reintenta en el próximo latido:
+
+          * hay un job en curso — borrar los archivos de un pipeline que se está
+            ejecutando puede fallar y dejar el disco sin liberar;
+          * el worker tiene una descarga en curso de esa clave y responde
+            FAILED_PRECONDITION (el pedido sigue vivo hasta que se cancele);
+          * el gRPC local no responde.
+        """
+        key = (key or "").strip()
+        if not key:
+            return False
+        if self._jobs_active > 0:
+            if key not in self._delete_warned:
+                self._delete_warned.add(key)
+                logger.info(
+                    "[bridge] borrado de %s en espera: hay %d job(s) en curso",
+                    key, self._jobs_active,
+                )
+            return False
+        try:
+            with grpc.insecure_channel(self.local_grpc) as channel:
+                stub = inference_pb2_grpc.InferenceServiceStub(channel)
+                stub.DeleteModel(
+                    inference_pb2.DeleteModelRequest(key=key), timeout=60
+                )
+            self._delete_warned.discard(key)
+            logger.info("[bridge] pesos borrados por pedido del panel: %s", key)
+            return True
+        except grpc.RpcError as exc:
+            code = exc.code() if hasattr(exc, "code") else None
+            name = str(getattr(code, "name", code))
+            if name == "NOT_FOUND":
+                # Clave que este worker no conoce: reintentar para siempre no
+                # arregla nada, así que se confirma y queda el log.
+                logger.warning(
+                    "[bridge] borrado de %s: el worker no conoce esa clave", key
+                )
+                return True
+            if key not in self._delete_warned:
+                self._delete_warned.add(key)
+                logger.warning(
+                    "[bridge] borrado de %s no ejecutado, reintento luego (%s): %s",
+                    key, name, exc.details() if hasattr(exc, "details") else exc,
+                )
             return False
 
     def _cancel_local(self, task_id: str) -> None:
