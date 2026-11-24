@@ -257,6 +257,19 @@ class InstallerApp(tk.Tk):
         ttk.Button(logbtns, text="Copiar diagnóstico",
                    command=self.on_copy_diag).pack(side="left", padx=(8, 0), ipady=2)
 
+        # Administración sin consola: modelos (misma API del front) y update.
+        wbtns = ttk.Frame(card, style="Card.TFrame")
+        wbtns.pack(fill="x", pady=(0, 8))
+        ttk.Button(wbtns, text="Modelos…",
+                   command=self.on_models).pack(side="left", ipady=2)
+        self.update_btn = ttk.Button(wbtns, text="Buscar actualización",
+                                     command=self.on_check_update)
+        self.update_btn.pack(side="left", padx=(8, 0), ipady=2)
+        self.models_summary = tk.StringVar(value="")
+        ttk.Label(card, textvariable=self.models_summary,
+                  style="Muted.TLabel", wraplength=620).pack(anchor="w",
+                                                             pady=(0, 8))
+
         btns = ttk.Frame(card, style="Card.TFrame")
         btns.pack(fill="x")
         self.start_btn = ttk.Button(btns, text="Detener worker",
@@ -477,6 +490,79 @@ class InstallerApp(tk.Tk):
         self.clipboard_append(text)
         messagebox.showinfo(APP_TITLE, "Diagnóstico copiado: pegalo en el chat de soporte.")
 
+    # ── modelos y actualización ──────────────────────────────────
+    def on_models(self) -> None:
+        """Ventana con el catálogo del worker y sus pesos."""
+        ModelsWindow(self)
+
+    def on_check_update(self) -> None:
+        """Compara la versión instalada con la publicada y ofrece actualizar."""
+        if self.busy:
+            return
+        self.update_btn.state(["disabled"])
+        self.update_btn.configure(text="Buscando…")
+
+        def job() -> None:
+            self.msgs.put(("update_info", core.check_update(self.workdir)))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _on_update_info(self, info: dict) -> None:
+        self.update_btn.state(["!disabled"])
+        self.update_btn.configure(text="Buscar actualización")
+        error = info.get("error") or ""
+        if error:
+            messagebox.showwarning(APP_TITLE, error)
+            return
+        current = info.get("current") or "desconocida"
+        if not info.get("available"):
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Ya tenés la última versión instalada (v{current}).")
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Hay una versión nueva: v{info.get('latest')}\n"
+                f"Instalada: v{current}\n\n"
+                "¿Actualizar ahora? El worker se reinicia solo y vuelve a "
+                "quedar en línea en menos de un minuto."):
+            return
+        self.update_btn.state(["disabled"])
+        self.update_btn.configure(text="Actualizando…")
+        self.models_summary.set(
+            "Actualizando el worker… se reinicia solo, no cierres la ventana.")
+
+        def job() -> None:
+            core.update(self.workdir)
+
+        def ok() -> None:
+            self.update_btn.configure(text="Buscar actualización")
+            self.update_btn.state(["!disabled"])
+            installed = core.local_version(self.workdir)
+            self.refresh_done()
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Worker actualizado a v{installed or '?'} y en línea de nuevo.")
+
+        self._run_bg(job, ok)
+
+    def _load_models_summary(self) -> None:
+        """Resumen de modelos para la pantalla Listo (en un thread, no bloquea)."""
+        try:
+            models = core.list_models()
+        except Exception:  # noqa: BLE001 — worker caído: se informa, no rompe
+            self.msgs.put(("models_summary",
+                           "Modelos: el worker no está respondiendo."))
+            return
+        ready = sum(1 for m in models if m.get("available"))
+        dropping = sum(1 for m in models if m.get("downloading"))
+        on_disk = sum(int(m.get("size_bytes") or 0) for m in models)
+        text = (f"Modelos: {ready} listos de {len(models)} · "
+                f"{_human_bytes(on_disk)} en disco")
+        if dropping:
+            text += f" · {dropping} descargando"
+        self.msgs.put(("models_summary", text))
+
     # ── estado final ─────────────────────────────────────────────
     def refresh_done(self) -> None:
         st = core.worker_status(self.workdir)
@@ -493,6 +579,11 @@ class InstallerApp(tk.Tk):
             text="Detener worker" if st["running"] else "Iniciar worker")
         self.autostart_var.set(core.autostart_enabled())
         self.refresh_logs()
+        if st["running"]:
+            threading.Thread(target=self._load_models_summary,
+                             daemon=True).start()
+        else:
+            self.models_summary.set("Modelos: el worker está detenido.")
 
     # ── cola de logs/errores ─────────────────────────────────────
     def _log_line(self, text: str) -> None:
@@ -513,6 +604,8 @@ class InstallerApp(tk.Tk):
                 elif kind == "err":
                     self.progress.stop()
                     self._set_busy(False)
+                    self.update_btn.configure(text="Buscar actualización")
+                    self.update_btn.state(["!disabled"])
                     self._log_line(f"✘ {payload}")
                     messagebox.showerror(APP_TITLE, payload)
                 elif kind == "pair_err":
@@ -525,6 +618,10 @@ class InstallerApp(tk.Tk):
                         for s in payload
                     ]
                     self.pair_msg.configure(text="\n".join(lines))
+                elif kind == "update_info":
+                    self._on_update_info(payload)
+                elif kind == "models_summary":
+                    self.models_summary.set(payload)
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
@@ -544,6 +641,232 @@ class InstallerApp(tk.Tk):
             logging.getLogger("synapta.installer").removeHandler(handler)
             self._log_handler = None
         super().destroy()
+
+
+def _human_bytes(size: float) -> str:
+    """Tamaño legible (GB/MB) sin dependencias."""
+    value = float(size or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+class ModelsWindow(tk.Toplevel):
+    """Catálogo del worker con gestión de pesos, sin salir del instalador.
+
+    Mismas operaciones que el panel del front (listar / descargar / cancelar /
+    borrar) pero contra el artifact server local del worker, que es el que
+    tiene los pesos de esta máquina.
+    """
+
+    COLUMNS = (
+        ("model", "Modelo", 250),
+        ("mode", "Tipo", 70),
+        ("vram", "VRAM", 70),
+        ("state", "Estado", 170),
+        ("size", "En disco", 100),
+    )
+
+    def __init__(self, app: InstallerApp) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title(f"{APP_TITLE} — Modelos")
+        self.geometry("820x480")
+        self.minsize(680, 400)
+        self.configure(bg=BG)
+        self.models: list[dict] = []
+        self.busy = False
+        self.closed = False
+        self._build()
+        self.refresh()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    # ── construcción ─────────────────────────────────────────────
+    def _build(self) -> None:
+        wrap = ttk.Frame(self, style="Bg.TFrame", padding=14)
+        wrap.pack(fill="both", expand=True)
+
+        self.summary = tk.StringVar(value="Cargando modelos…")
+        ttk.Label(wrap, textvariable=self.summary, style="Bg.TLabel",
+                  wraplength=760).pack(anchor="w", pady=(0, 8))
+
+        columns = [c[0] for c in self.COLUMNS]
+        self.tree = ttk.Treeview(wrap, columns=columns, show="headings",
+                                 height=14, selectmode="browse")
+        for key, title, width in self.COLUMNS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_buttons())
+        self.tree.bind("<Double-1>", lambda _e: self.on_download())
+
+        buttons = ttk.Frame(wrap, style="Bg.TFrame")
+        buttons.pack(fill="x", pady=(10, 0))
+        self.download_btn = ttk.Button(buttons, text="Descargar pesos",
+                                       command=self.on_download)
+        self.download_btn.pack(side="left", ipady=2)
+        self.cancel_btn = ttk.Button(buttons, text="Cancelar descarga",
+                                     command=self.on_cancel)
+        self.cancel_btn.pack(side="left", padx=(8, 0), ipady=2)
+        self.delete_btn = ttk.Button(buttons, text="Borrar pesos",
+                                     command=self.on_delete)
+        self.delete_btn.pack(side="left", padx=(8, 0), ipady=2)
+        ttk.Button(buttons, text="Actualizar lista",
+                   command=self.refresh).pack(side="left", padx=(8, 0), ipady=2)
+        ttk.Button(buttons, text="Cerrar",
+                   command=self.close).pack(side="right", ipady=2)
+        self._sync_buttons()
+
+    # ── datos ────────────────────────────────────────────────────
+    def refresh(self) -> None:
+        if self.closed:
+            return
+        try:
+            models = core.list_models()
+        except Exception:  # noqa: BLE001 — worker caído: se avisa y se reintenta
+            self.summary.set(
+                "El worker no responde en el puerto local. Iniciá el worker y "
+                "volvé a probar (reintento automático en 3 s).")
+            self._schedule(3000)
+            return
+        self.models = models
+        selected = self.tree.selection()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for model in models:
+            key = str(model.get("key") or "")
+            state, _dl, _cancel, _delete = self._state(model)
+            self.tree.insert("", "end", iid=key, values=(
+                model.get("label") or key,
+                model.get("mode") or "",
+                f"{model.get('vram_gb')} GB" if model.get("vram_gb") else "—",
+                state,
+                _human_bytes(model.get("size_bytes") or 0),
+            ))
+        for iid in selected:
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+        ready = sum(1 for m in models if m.get("available"))
+        on_disk = sum(int(m.get("size_bytes") or 0) for m in models)
+        self.summary.set(
+            f"{ready} listos de {len(models)} · {_human_bytes(on_disk)} en disco. "
+            "Elegí un modelo de la lista para descargar o borrar sus pesos.")
+        self._sync_buttons()
+        self._schedule(2500)
+
+    def _schedule(self, ms: int) -> None:
+        if self.closed:
+            return
+        try:
+            self.after(ms, self.refresh)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _state(model: dict) -> tuple:
+        """(texto de estado, puede_descargar, puede_cancelar, puede_borrar)."""
+        if model.get("downloading"):
+            return (f"Descargando {float(model.get('progress') or 0):.0f}%",
+                    False, True, False)
+        if model.get("available"):
+            return "Listo", False, False, bool(model.get("size_bytes"))
+        error = str(model.get("error") or "")
+        if error:
+            return f"Error: {error[:40]}", True, False, bool(model.get("size_bytes"))
+        if model.get("size_bytes"):
+            return "Pesos incompletos", True, False, True
+        return "No descargado", True, False, False
+
+    def _selected(self) -> Optional[dict]:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        key = selected[0]
+        for model in self.models:
+            if str(model.get("key")) == key:
+                return model
+        return None
+
+    def _sync_buttons(self) -> None:
+        model = self._selected()
+        _state, can_download, can_cancel, can_delete = (
+            self._state(model) if model else ("", False, False, False))
+        idle = not self.busy and model is not None
+        for btn, allowed in ((self.download_btn, can_download),
+                             (self.cancel_btn, can_cancel),
+                             (self.delete_btn, can_delete)):
+            btn.state(["!disabled"] if (allowed and idle) else ["disabled"])
+
+    # ── acciones ─────────────────────────────────────────────────
+    def on_download(self) -> None:
+        model = self._selected()
+        if not model:
+            return
+        key = str(model.get("key"))
+        self._run(lambda: core.download_model(key),
+                  f"Descargando {model.get('label') or key}…")
+
+    def on_cancel(self) -> None:
+        model = self._selected()
+        if not model:
+            return
+        key = str(model.get("key"))
+        self._run(lambda: core.cancel_model_download(key),
+                  f"Cancelando la descarga de {model.get('label') or key}…")
+
+    def on_delete(self) -> None:
+        model = self._selected()
+        if not model:
+            return
+        key = str(model.get("key"))
+        name = model.get("label") or key
+        size = _human_bytes(model.get("size_bytes") or 0)
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"¿Borrar los pesos de {name} ({size})?\n"
+                "Se pueden volver a descargar, pero hay que bajarlos de nuevo."):
+            return
+        self._run(lambda: core.delete_model(key), f"Borrando {name}…")
+
+    def _run(self, action, message: str) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.summary.set(message)
+        self._sync_buttons()
+
+        def job() -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 — user-facing
+                self._post(self._failed, str(exc))
+                return
+            self._post(self._finished)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _post(self, fn, *args) -> None:
+        if self.closed:
+            return
+        try:
+            self.after(0, lambda: fn(*args))
+        except tk.TclError:
+            pass
+
+    def _failed(self, error: str) -> None:
+        self.busy = False
+        self.summary.set(f"No se pudo: {error}")
+        self._sync_buttons()
+
+    def _finished(self) -> None:
+        self.busy = False
+        self.refresh()
+
+    def close(self) -> None:
+        self.closed = True
+        self.destroy()
 
 
 def main() -> int:

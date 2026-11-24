@@ -28,10 +28,13 @@ carpeta no sirve como CA: httpx/ssl la rechazan con "Permission denied").
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -42,6 +45,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger("synapta.installer")
 
@@ -80,10 +84,14 @@ PAYLOAD_REQUIRED = ("run.py", "pair.py", "requirements.txt")
 GRPC_PORT = 50051
 
 # ── payload ───────────────────────────────────────────────────────
+# `installer/` SÍ va en el payload: `scripts/update_worker.py` (el que usa
+# POST /worker/update) hace `from core import ...`, y cuando la carpeta no
+# estaba en el zip el auto-update del worker moría con ImportError. Son ~40 KB
+# de stdlib; no arrastra dependencias al cliente.
 EXCLUDE_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".venv", "venv",
     "dist", "build", "outputs", "models", ".cache", ".angular",
-    "installer", "node_modules", "huggingface", "checkpoints", "temp",
+    "node_modules", "huggingface", "checkpoints", "temp",
     "tests",
 }
 EXCLUDE_EXTS = {".log", ".pyc", ".pyo", ".safetensors", ".ckpt", ".pth",
@@ -629,6 +637,7 @@ def install(workdir: Optional[Path] = None,
     py = ensure_python(workdir)
     ensure_pip(py, workdir)
     install_deps(py, workdir)
+    _mark_requirements(workdir)
     if not skip_doctor:
         run_doctor(py, workdir)
 
@@ -1085,6 +1094,188 @@ def worker_status(workdir: Optional[Path] = None) -> dict:
         "worker_id": worker_id,
         "running": port_open(GRPC_PORT),
     }
+
+
+# ── worker local: modelos y actualización ─────────────────────────
+#
+# El artifact server del worker (:50052) ya expone el catálogo con el estado
+# real de pesos, las operaciones de descarga/cancelación/borrado y
+# `POST /worker/update`. La GUI habla con eso por HTTP en loopback: son las
+# mismas operaciones que el panel del front, sin consola y sin duplicar acá la
+# lógica de modelos. En loopback el server no pide token (el instalador no
+# define BM_ARTIFACT_TOKEN).
+ARTIFACT_PORT = int(os.environ.get("BM_ARTIFACT_PORT", "50052") or 0)
+ARTIFACT_HOST = "127.0.0.1"
+# Marca con el hash de las dependencias instaladas (ver `_mark_requirements`).
+REQ_MARKER = "requirements.sha256"
+_VERSION_RE = re.compile(r'^\s*BRIDGE_VERSION\s*=\s*"([^"]+)"', re.M)
+
+
+def art_url() -> str:
+    """Base de la API local del worker (artifact server en loopback)."""
+    return f"http://{ARTIFACT_HOST}:{ARTIFACT_PORT}"
+
+
+def _api_json(method: str, path: str, timeout: float = 15.0,
+              body: Optional[dict] = None) -> dict:
+    """GET/POST/DELETE contra el artifact server local del worker."""
+    data = json.dumps(body or {}).encode() if method in ("POST", "DELETE") else None
+    req = urllib.request.Request(art_url() + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    return json.loads(raw) if raw.strip() else {}
+
+
+def list_models() -> list:
+    """Catálogo del worker con estado de pesos (lo que muestra «Modelos»)."""
+    return list(_api_json("GET", "/models").get("models") or [])
+
+
+def download_model(key: str) -> dict:
+    """Inicia la descarga de pesos de un modelo en el worker local."""
+    return _api_json("POST", f"/models/{quote(key, safe='')}/download")
+
+
+def cancel_model_download(key: str) -> dict:
+    return _api_json("POST", f"/models/{quote(key, safe='')}/cancel")
+
+
+def delete_model(key: str) -> dict:
+    """Borra los pesos del disco (los del catálogo quedan listados)."""
+    return _api_json("DELETE", f"/models/{quote(key, safe='')}")
+
+
+def version_from_init(text: str) -> str:
+    """BRIDGE_VERSION de un bridge/__init__.py, sin importar el paquete."""
+    match = _VERSION_RE.search(text or "")
+    return match.group(1) if match else ""
+
+
+def local_version(workdir: Optional[Path] = None) -> str:
+    """Versión del worker instalado en esta máquina ("" si no hay)."""
+    workdir = (workdir or default_dir()).expanduser().resolve()
+    init = worker_dir(workdir) / "bridge" / "__init__.py"
+    try:
+        return version_from_init(init.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def version_from_payload(data: bytes) -> str:
+    """Versión declarada por un payload zip (bytes), sin escribirlo a disco."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            text = zf.read("bridge/__init__.py").decode("utf-8", "replace")
+    except (KeyError, zipfile.BadZipFile, OSError):
+        return ""
+    return version_from_init(text)
+
+
+def published_version(url: Optional[str] = None,
+                      timeout: float = 60.0) -> str:
+    """Versión del zip publicado (el mismo que baja el instalador)."""
+    req = urllib.request.Request(url or PAYLOAD_URL)
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_tls_context()) as resp:
+        return version_from_payload(resp.read())
+
+
+def check_update(workdir: Optional[Path] = None, url: Optional[str] = None) -> dict:
+    """{current, latest, available, error} para el botón «Actualizar»."""
+    current = local_version(workdir)
+    try:
+        latest = published_version(url)
+    except Exception as exc:  # noqa: BLE001 — sin red el botón informa, no rompe
+        return {"current": current, "latest": "", "available": False,
+                "error": f"no pude consultar la última versión: {exc}"}
+    return {
+        "current": current,
+        "latest": latest,
+        "available": bool(latest) and latest != current,
+        "error": "",
+    }
+
+
+def _requirements_hash(workdir: Path) -> str:
+    """sha256 del requirements.txt instalado ("" si no hay archivo)."""
+    try:
+        data = (worker_dir(workdir) / "requirements.txt").read_bytes()
+    except OSError:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _mark_requirements(workdir: Path) -> None:
+    """Anota el hash de las dependencias ya instaladas.
+
+    Sin esto, cada actualización reinstala todo con pip aunque nada haya
+    cambiado: minutos de espera para bajar el mismo código.
+    """
+    try:
+        (workdir / REQ_MARKER).write_text(_requirements_hash(workdir),
+                                          encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 — sólo optimiza, no es requisito
+        logger.warning("no pude anotar las dependencias instaladas: %s", exc)
+
+
+def _requirements_changed(workdir: Path) -> bool:
+    try:
+        previous = (workdir / REQ_MARKER).read_text(encoding="utf-8").strip()
+    except OSError:
+        return True  # instalación vieja sin marca: se reinstala por las dudas
+    return previous != _requirements_hash(workdir)
+
+
+def update(workdir: Optional[Path] = None, url: Optional[str] = None) -> dict:
+    """Actualiza el worker instalado al payload publicado.
+
+    Baja el zip, reemplaza SOLO el código (python/ y la caché de pesos de
+    Hugging Face quedan intactos), reinstala dependencias únicamente si cambió
+    `requirements.txt` y vuelve a arrancar el worker. Es la ruta que usa el
+    botón «Buscar actualización» de la GUI: no depende del endpoint
+    /worker/update, que necesita el worker ya actualizado para funcionar.
+    """
+    workdir = (workdir or default_dir()).expanduser().resolve()
+    if not (worker_dir(workdir) / "run.py").exists():
+        raise RuntimeError("el worker no está instalado todavía: usá «Instalar» primero")
+
+    tmp = workdir / "update-payload.zip"
+    logger.info("bajando la última versión del worker…")
+    download_payload(url or PAYLOAD_URL, tmp)
+    new_version = version_from_payload(tmp.read_bytes())
+    logger.info("payload nuevo: v%s", new_version or "(sin versión)")
+
+    # Windows bloquea las DLL del proceso vivo: primero se detiene.
+    stop(workdir)
+    logger.info("reemplazando el código del worker…")
+    extract_payload(tmp, worker_dir(workdir))
+    tmp.unlink(missing_ok=True)
+
+    py = python_path(workdir)
+    if py.exists() and _requirements_changed(workdir):
+        try:
+            install_deps(py, workdir)
+            _mark_requirements(workdir)
+        except Exception as exc:  # noqa: BLE001 — el código nuevo ya está puesto
+            logger.warning("no pude actualizar las dependencias: %s", exc)
+    elif py.exists():
+        logger.info("dependencias sin cambios: no se reinstalan")
+
+    start(workdir)
+    logger.info("worker actualizado a v%s y en línea", new_version or "?")
+    return {"version": new_version, "workdir": str(workdir)}
+
+
+def apply_update(url: Optional[str] = None, timeout: float = 20.0) -> dict:
+    """Pide al worker que se actualice solo y se reinicie.
+
+    El worker baja el zip, verifica, se detiene, reemplaza archivos y se
+    relanza (`scripts/update_worker.py`), así que esta llamada vuelve enseguida.
+    """
+    return _api_json("POST", "/worker/update", timeout=timeout,
+                     body={"url": url or PAYLOAD_URL})
 
 
 # ── autostart (carpeta de inicio: sin admin) ──────────────────────

@@ -55,10 +55,13 @@ def test_build_payload_excludes_junk(tmp_path):
     assert "requirements.txt" in names
     # basura, tests y secretos quedan afuera
     assert not any(n.startswith((".git/", "__pycache__/", "outputs/",
-                                 "models/", "tests/", "installer/"))
+                                 "models/", "tests/"))
                    for n in names)
     assert "worker-err.log" not in names
     assert ".env" not in names
+    # `installer/` SÍ viaja: update_worker.py importa core de ahí y sin eso el
+    # auto-update del worker moría con ImportError.
+    assert "installer/app.py" in names
     assert count == len(names) >= 3
 
 
@@ -675,3 +678,227 @@ def test_gui_destroy_detaches_log_handler(tmp_path, monkeypatch):
         gui.destroy()
     assert not any(isinstance(h, app_mod.QueueLogHandler)
                    for h in root_logger.handlers)
+
+
+# ── modelos y actualización (GUI del instalador) ─────────────────
+def _init_with_version(version: str) -> str:
+    return f'"""doc"""\n\nBRIDGE_VERSION = "{version}"\n'
+
+
+def test_version_from_init_y_payload():
+    text = _init_with_version("0.2.17")
+    assert core.version_from_init(text) == "0.2.17"
+    assert core.version_from_init("sin version") == ""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("bridge/__init__.py", text)
+        zf.writestr("run.py", "print('hi')\n")
+    assert core.version_from_payload(buffer.getvalue()) == "0.2.17"
+    assert core.version_from_payload(b"no soy un zip") == ""
+
+
+def test_local_version_lee_el_worker_instalado(tmp_path):
+    init = tmp_path / "worker" / "bridge" / "__init__.py"
+    init.parent.mkdir(parents=True)
+    init.write_text(_init_with_version("0.2.16"), encoding="utf-8")
+
+    assert core.local_version(tmp_path) == "0.2.16"
+    assert core.local_version(tmp_path / "no-instalado") == ""
+
+
+def test_check_update_sin_red_no_rompe(tmp_path, monkeypatch):
+    def boom(url=None, timeout=0):
+        raise OSError("sin red")
+
+    monkeypatch.setattr(core, "published_version", boom)
+    info = core.check_update(tmp_path)
+
+    assert info["available"] is False
+    assert "sin red" in info["error"]
+
+
+def test_check_update_detecta_version_nueva(tmp_path, monkeypatch):
+    init = tmp_path / "worker" / "bridge" / "__init__.py"
+    init.parent.mkdir(parents=True)
+    init.write_text(_init_with_version("0.2.16"), encoding="utf-8")
+    monkeypatch.setattr(core, "published_version",
+                        lambda url=None, timeout=0: "0.2.17")
+
+    info = core.check_update(tmp_path)
+
+    assert info == {"current": "0.2.16", "latest": "0.2.17",
+                    "available": True, "error": ""}
+
+
+def test_check_update_sin_novedad(tmp_path, monkeypatch):
+    init = tmp_path / "worker" / "bridge" / "__init__.py"
+    init.parent.mkdir(parents=True)
+    init.write_text(_init_with_version("0.2.17"), encoding="utf-8")
+    monkeypatch.setattr(core, "published_version",
+                        lambda url=None, timeout=0: "0.2.17")
+
+    assert core.check_update(tmp_path)["available"] is False
+
+
+def test_modelos_pegan_en_los_paths_del_artifact_server(monkeypatch):
+    """Listar/descargar/cancelar/borrar contra la API local del worker."""
+    calls = []
+
+    class _Resp:
+        def __init__(self, body):
+            self.body = body
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        calls.append((req.get_method(), req.full_url))
+        return _Resp(b'{"models": [{"key": "SD-1.5"}], "count": 1}')
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake_urlopen)
+
+    assert core.list_models() == [{"key": "SD-1.5"}]
+    core.download_model("SD 1.5")
+    core.cancel_model_download("SD-1.5")
+    core.delete_model("SD-1.5")
+
+    base = core.art_url()
+    assert calls == [
+        ("GET", f"{base}/models"),
+        ("POST", f"{base}/models/SD%201.5/download"),
+        ("POST", f"{base}/models/SD-1.5/cancel"),
+        ("DELETE", f"{base}/models/SD-1.5"),
+    ]
+
+
+def test_update_reemplaza_codigo_sin_tocar_python_ni_pesos(tmp_path, monkeypatch):
+    """La actualización baja el zip, para, reemplaza y vuelve a arrancar."""
+    (tmp_path / "worker").mkdir()
+    (tmp_path / "worker" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+    core.python_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    core.python_path(tmp_path).write_bytes(b"")
+    events = []
+
+    def fake_download(url, dest, timeout=60.0):
+        events.append(("download", url))
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("run.py", "print('nuevo')\n")
+            zf.writestr("bridge/__init__.py", _init_with_version("0.2.18"))
+            zf.writestr("requirements.txt", "grpcio\n")
+        Path(dest).write_bytes(buffer.getvalue())
+        return Path(dest)
+
+    def fake_extract(zip_path, target, retries=6):
+        events.append(("extract", str(target)))
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(target)
+
+    monkeypatch.setattr(core, "download_payload", fake_download)
+    monkeypatch.setattr(core, "extract_payload", fake_extract)
+    monkeypatch.setattr(core, "stop", lambda *a, **k: events.append(("stop", None)))
+    monkeypatch.setattr(core, "start", lambda *a, **k: events.append(("start", None)))
+    monkeypatch.setattr(core, "install_deps",
+                        lambda *a, **k: events.append(("deps", None)))
+
+    info = core.update(tmp_path, url="http://example/worker.zip")
+
+    assert info["version"] == "0.2.18"
+    assert (tmp_path / "worker" / "run.py").read_text(encoding="utf-8") == "print('nuevo')\n"
+    # python/ y el resto del workdir quedan intactos; el zip temporal se borra
+    assert (tmp_path / "python").is_dir()
+    assert not (tmp_path / "update-payload.zip").exists()
+    # orden: bajar → detener → reemplazar → arrancar
+    assert [e[0] for e in events][:3] == ["download", "stop", "extract"]
+    assert events[-1][0] == "start"
+    # sin requirements.txt previo se reinstalan y queda la marca
+    assert ("deps", None) in events
+    assert (tmp_path / core.REQ_MARKER).exists()
+
+
+def test_update_saltea_las_dependencias_si_no_cambiaron(tmp_path, monkeypatch):
+    (tmp_path / "worker").mkdir()
+    (tmp_path / "worker" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+    # bytes y no write_text: en Windows el modo texto traduce \n a \r\n y el
+    # hash cambiaria respecto del zip (que guarda \n tal cual).
+    (tmp_path / "worker" / "requirements.txt").write_bytes(b"grpcio\n")
+    core.python_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    core.python_path(tmp_path).write_bytes(b"")
+    core._mark_requirements(tmp_path)
+    events = []
+
+    def fake_download(url, dest, timeout=60.0):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("bridge/__init__.py", _init_with_version("0.2.18"))
+            zf.writestr("requirements.txt", "grpcio\n")
+        Path(dest).write_bytes(buffer.getvalue())
+        return Path(dest)
+
+    monkeypatch.setattr(core, "download_payload", fake_download)
+    monkeypatch.setattr(core, "extract_payload",
+                        lambda zip_path, target, retries=6: zipfile.ZipFile(zip_path).extractall(target))
+    monkeypatch.setattr(core, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(core, "start", lambda *a, **k: None)
+    monkeypatch.setattr(core, "install_deps",
+                        lambda *a, **k: events.append("deps"))
+
+    core.update(tmp_path)
+
+    assert events == []  # requirements igual: pip no corre
+
+
+def test_update_sin_worker_instalado_falla_claro(tmp_path):
+    with pytest.raises(RuntimeError, match="no está instalado"):
+        core.update(tmp_path)
+
+
+def test_gui_modelos_lista_y_habilita_acciones(tmp_path, monkeypatch):
+    tk = pytest.importorskip("tkinter")
+    monkeypatch.setattr(core, "default_dir", lambda: tmp_path)
+    monkeypatch.setattr(core, "port_open", lambda *a, **k: False)
+    monkeypatch.setattr(core, "list_models", lambda: [
+        {"key": "SD-1.5", "label": "SD 1.5", "mode": "image", "vram_gb": 4,
+         "available": True, "downloading": False, "size_bytes": 4 * 1024**3,
+         "progress": 100.0, "error": ""},
+        {"key": "FLUX.1-dev", "label": "FLUX dev", "mode": "image",
+         "vram_gb": 24, "available": False, "downloading": True,
+         "size_bytes": 1024**3, "progress": 12.0, "error": ""},
+    ])
+
+    from installer import app as app_mod
+
+    try:
+        gui = app_mod.InstallerApp()
+    except tk.TclError:
+        pytest.skip("sin pantalla interactiva")
+
+    window = None
+    try:
+        window = app_mod.ModelsWindow(gui)
+        window.refresh()  # el auto-refresh puede no haber corrido aún
+        rows = window.tree.get_children()
+        assert list(rows) == ["SD-1.5", "FLUX.1-dev"]
+        assert "4.0 GB" in window.tree.item("SD-1.5", "values")
+        assert "Descargando 12%" in window.tree.item("FLUX.1-dev", "values")
+
+        window.tree.selection_set("SD-1.5")
+        window._sync_buttons()
+        assert window.delete_btn.instate(["!disabled"])
+        assert window.download_btn.instate(["disabled"])
+
+        window.tree.selection_set("FLUX.1-dev")
+        window._sync_buttons()
+        assert window.cancel_btn.instate(["!disabled"])
+        assert window.download_btn.instate(["disabled"])
+    finally:
+        if window is not None:
+            window.close()
+        gui.destroy()
