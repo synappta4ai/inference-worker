@@ -65,4 +65,8 @@ Piezas:
 # 0.2.25: el heartbeat manda `vram_total_mb`: el panel mostraba «Memoria —» y
 # toda la columna «En tu GPU» en «—» porque el registry quedaba en 0 (sólo se
 # guardaba al emparejar). Un 0 conserva el último valor conocido.
-BRIDGE_VERSION = "0.2.25"
+# 0.2.26: actualización remota desde /admin/gpu: el agente atiende
+# `requested_update` del heartbeat, lanza el updater desacoplado (baja el
+# payload, se reinicia) y el proceso nuevo confirma con `completed_update`;
+# hasta entonces el panel muestra «Actualizando…».
+BRIDGE_VERSION = "0.2.26"
