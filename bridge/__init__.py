@@ -37,4 +37,6 @@ Piezas:
 # constraint, así pip ya no puede dejar un torch CPU en una máquina con GPU.
 # 0.2.14: el video respeta el ratio pedido (`_video_dims` deriva width/height del
 # max_side del modelo en múltiplos de 32); antes un pedido 9:16 salía 832x480.
-BRIDGE_VERSION = "0.2.14"
+# 0.2.15: calidad del clip de Wan: bfloat16 + VAE fp32, negative prompt por
+# defecto y `num_frames` en 4k+1 (el VAE temporal de Wan lo exige).
+BRIDGE_VERSION = "0.2.15"
