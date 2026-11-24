@@ -83,7 +83,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         engine="diffusers", repo="stable-diffusion-v1-5/stable-diffusion-v1-5",
         mode="image", pipeline="sd15",
         steps=20, guidance_scale=7.5, max_side=512, vram_gb=4, family="sd",
-        notes="3060, 4060, 5050 e Intel Arc: 512 px en fp16",
+        notes="3060, 4060, 5050 e Intel Arc: 512 px en fp16; en iGPU Ryzen corre en CPU fp32",
     ),
     "SD-Turbo": ModelSpec(
         key="SD-Turbo",
@@ -91,7 +91,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         engine="diffusers", repo="stabilityai/sd-turbo",
         mode="image", pipeline="sd15", dtype="float16",
         steps=4, guidance_scale=0.0, max_side=512, vram_gb=4, family="sd",
-        notes="iGPU/CPU (Ryzen, Intel integrada): 512 px en 4 pasos",
+        notes="CPU/iGPU (Ryzen, Intel UHD): 512 px en 4 pasos, fp32 automático",
     ),
     "SDXL-Turbo": ModelSpec(
         key="SDXL-Turbo",

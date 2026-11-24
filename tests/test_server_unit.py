@@ -230,15 +230,26 @@ class TestEnhancePrompt:
 class TestGetGpuTelemetry:
 
     async def test_telemetry_without_cuda(self, servicer, monkeypatch):
-        # "Sin CUDA" se fija a propósito: la máquina de desarrollo ya tiene
-        # GPU (RTX 5070) y el test dependía de que no la hubiera.
-        monkeypatch.setattr("vram_manager.HAS_TORCH", False)
+        # Dispositivo CPU fijo a propósito: la máquina de desarrollo ya tiene
+        # GPU (RTX 5070) y el test no debe depender de eso.
+        import device as device_mod
+
+        monkeypatch.setattr(
+            device_mod, "_OVERRIDE",
+            device_mod.DeviceInfo(
+                backend="cpu", torch_device="cpu", name="AMD Ryzen 7 7840U",
+                vendor="AMD", total_mb=32768, free_mb=20000,
+                precision="float32", reason="sin acelerador", fixed=True,
+            ),
+        )
         resp = await servicer.GetGpuTelemetry(
             inference_pb2.GpuTelemetryRequest(), None
         )
-        # Sin torch/CUDA el telemetrista reporta CPU.
-        assert resp.device_name == "CPU / No CUDA"
-        assert resp.total_vram_mb == 0
+        # Sin acelerador el nombre dice CPU + precisión y la memoria es RAM.
+        assert resp.device_name == "AMD Ryzen 7 7840U (CPU, fp32)"
+        assert resp.total_vram_mb == 32768
+        assert resp.free_vram_mb == 20000
+        assert resp.used_vram_mb == 12768
 
 
 # ----------------------------------------------------------------------

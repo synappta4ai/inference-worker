@@ -25,6 +25,7 @@ from dataclasses import asdict
 from typing import Callable
 
 from .base import EngineContext, ModelSpec
+import device as device_mod
 
 logger = logging.getLogger("DiffusionFactory")
 
@@ -34,12 +35,43 @@ _LOCK = threading.Lock()
 
 
 def _has_cuda() -> bool:
-    try:
-        import torch
+    """true sólo si el acelerador elegido es NVIDIA (o ROCm).
 
-        return torch.cuda.is_available()
-    except Exception:
-        return False
+    Se mantiene por compatibilidad: el worker ya no asume CUDA en ningún
+    lado, usa `device` (CUDA / XPU / CPU).
+    """
+    return device_mod.current().backend == "cuda"
+
+
+def _device_for(use_gpu: bool) -> device_mod.DeviceInfo:
+    """Dispositivo real de la carga.
+
+    `use_gpu=False` fuerza CPU (no importa torch); `True` detecta el mejor
+    acelerador disponible: Intel Arc (XPU) o NVIDIA (CUDA).
+    """
+    return device_mod.current(use_accel=use_gpu)
+
+
+def _enable_offload(pipe, dev: device_mod.DeviceInfo) -> None:
+    """Deja el pipeline por etapas en el acelerador real (CUDA o XPU).
+
+    Sin `device=` accelerate asume `cuda` y en una Intel Arc falla con
+    "Torch not compiled with CUDA enabled". Si el diffusers instalado no
+    acepta el parámetro, se deja el pipeline entero en el dispositivo.
+    """
+    try:
+        if dev.backend == "cuda":
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe.enable_model_cpu_offload(device=dev.torch_device)
+    except TypeError:
+        pipe.to(dev.torch_device)
+    except Exception as exc:  # noqa: BLE001 — offload es optimización
+        logger.warning(
+            "[Factory] offload no disponible (%s): pipeline entero en %s",
+            exc, dev.torch_device,
+        )
+        pipe.to(dev.torch_device)
 
 
 def _release_pipelines() -> int:
@@ -53,14 +85,7 @@ def _release_pipelines() -> int:
         _PIPELINES.clear()
     if n:
         gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        device_mod.empty_cache()
         logger.info("[Factory] %d pipeline(s) cacheados liberados", n)
     return n
 
@@ -95,8 +120,10 @@ def _load_need_gb(spec: ModelSpec, use_gpu: bool) -> tuple[float, str, float]:
         # 4-bit): en RAM queda el pico de carga, ~60 % del disco (fp32 → fp16).
         need = max(weights_gb * 0.6, spec.vram_gb * 1.1) + _RAM_OVERHEAD_GB
         return need, "disco", weights_gb
-    # CPU: todo el pipeline se materializa en RAM.
-    return weights_gb + _RAM_OVERHEAD_GB, "disco", weights_gb
+    # CPU: todo el pipeline se materializa en RAM, y la precisión efectiva
+    # pesa: fp32 ocupa el doble que los safetensors fp16 del repo.
+    factor = 2.0 if device_mod.dtype_name(spec.dtype, _device_for(False)) == "float32" else 1.1
+    return weights_gb * factor + _RAM_OVERHEAD_GB, "disco", weights_gb
 
 
 def _check_memory_before_load(spec: ModelSpec, use_gpu: bool) -> None:
@@ -143,6 +170,26 @@ def _check_memory_before_load(spec: ModelSpec, use_gpu: bool) -> None:
 # Carga por familia
 # ----------------------------------------------------------------------
 
+def _place_image_pipeline(pipe, dev, use_gpu: bool) -> None:
+    """Deja el pipeline listo para SU dispositivo.
+
+    - CUDA/XPU: offload de modelos (entra y sale de VRAM); es lo que hace
+      entrar SDXL/Flux en 8 GB.
+    - CPU: fp32 + attention slicing + VAE slicing/tiling. Sin esto, SD-1.5 en
+      una iGPU Ryzen arma todo el pipeline de golpe y el SO mata el proceso.
+    """
+    if not use_gpu or not dev.is_gpu:
+        pipe.enable_attention_slicing()
+        _enable_vae_opt(pipe, "enable_slicing", "enable_vae_slicing")
+        _enable_vae_opt(pipe, "enable_tiling", "enable_vae_tiling")
+        logger.info(
+            "[Factory] CPU (%s, %s): attention slicing + VAE slicing/tiling",
+            dev.name, dev.pretty_precision,
+        )
+        return
+    _enable_offload(pipe, dev)
+
+
 def _load_image_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     import torch
     from diffusers import (
@@ -151,7 +198,9 @@ def _load_image_pipeline(repo: str, use_gpu: bool, dtype_str: str):
         StableDiffusionXLPipeline,
     )
 
-    dtype = getattr(torch, dtype_str)
+    dev = _device_for(use_gpu)
+    nombre_dtype = device_mod.dtype_name(dtype_str, dev)
+    dtype = getattr(torch, nombre_dtype)
     if "flux" in repo.lower():
         cls = FluxPipeline
     elif "sdxl" in repo.lower() or "xl-base" in repo.lower():
@@ -159,17 +208,16 @@ def _load_image_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     else:
         cls = StableDiffusionPipeline
 
-    logger.info("[Factory] Cargando imagen %s (gpu=%s, %s)...", repo, use_gpu, dtype_str)
+    logger.info(
+        "[Factory] imagen %s · %s (pedido %s)", repo, dev.describe(), dtype_str
+    )
     # Sin pesos en disco no se genera: la descarga se pide desde /gpu
     # (modo personal) en vez de saturar la máquina por sorpresa.
     from model_ops import require_weights  # tardío: evita ciclo de imports
 
     require_weights(repo)
     pipe = cls.from_pretrained(repo, torch_dtype=dtype)
-    if use_gpu:
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.enable_attention_slicing()
+    _place_image_pipeline(pipe, dev, use_gpu)
     return pipe
 
 
@@ -194,7 +242,7 @@ def _enable_vae_opt(pipe, *names: str) -> None:
             return
 
 
-def _offload_sequentially(pipe, dtype=None) -> None:
+def _offload_sequentially(pipe, dtype=None, dev=None) -> None:
     """Uso secuencial de la VRAM: TE, transformer y VAE nunca conviven.
 
     Medido en la RTX 5070 (8 GB): con el pipeline entero residente el driver
@@ -209,10 +257,11 @@ def _offload_sequentially(pipe, dtype=None) -> None:
     import torch
     from accelerate import cpu_offload_with_hook
 
+    dev = dev or _device_for(True)
     # El VAE se llama con `.decode()`, así que su hook va en el módulo entero
     # (diffusers aplica `apply_forward_hook` ahí).
-    cpu_offload_with_hook(pipe.transformer, "cuda")
-    cpu_offload_with_hook(pipe.vae, "cuda")
+    cpu_offload_with_hook(pipe.transformer, dev.torch_device)
+    cpu_offload_with_hook(pipe.vae, dev.torch_device)
 
     te = getattr(pipe, "text_encoder", None)
     if te is None:
@@ -225,17 +274,17 @@ def _offload_sequentially(pipe, dtype=None) -> None:
         if prm.dtype == torch.float32:
             prm.data = prm.data.to(destino)
 
-    _wrap_encode_prompt(pipe, te, torch)
+    _wrap_encode_prompt(pipe, te, torch, dev)
 
     # El primer forward del TE paga ~40 s de kernels de bitsandbytes (el
     # segundo tarda 0,4 s). Se hace acá, mientras la carga ya está pagando la
     # cuantización, y se devuelve el TE a RAM para no dejar 5,5 GB ociosos.
-    _warmup_text_encoder(pipe, te, torch)
+    _warmup_text_encoder(pipe, te, torch, dev)
     te.to("cpu")
-    torch.cuda.empty_cache()
+    device_mod.empty_cache(dev)
 
 
-def _wrap_encode_prompt(pipe, te, torch) -> None:
+def _wrap_encode_prompt(pipe, te, torch, dev=None) -> None:
     """Sube el TE para codificar y lo baja dentro del mismo `encode_prompt`.
 
     No alcanza con moverlo antes del `pipe(...)`: el encode ocurre dentro, y el
@@ -245,19 +294,20 @@ def _wrap_encode_prompt(pipe, te, torch) -> None:
     """
     if getattr(pipe, "_bm_encode_wrapped", False):
         return
+    dev = dev or _device_for(True)
     original = pipe.encode_prompt
 
     @functools.wraps(original)
     def encode_then_offload(*args, **kwargs):
         t0 = time.time()
-        te.to("cuda")
+        te.to(dev.torch_device)
         t1 = time.time()
         try:
             out = original(*args, **kwargs)
         finally:
             t2 = time.time()
             te.to("cpu")
-            torch.cuda.empty_cache()
+            device_mod.empty_cache(dev)
         logger.info(
             "[Factory] encode del prompt en %.1f s (subir %.1f, forward %.1f, "
             "bajar %.1f)", time.time() - t0, t1 - t0, t2 - t1, time.time() - t2
@@ -268,7 +318,7 @@ def _wrap_encode_prompt(pipe, te, torch) -> None:
     pipe._bm_encode_wrapped = True
 
 
-def _warmup_text_encoder(pipe, te, torch) -> None:
+def _warmup_text_encoder(pipe, te, torch, dev=None) -> None:
     """Adelanta el primer forward del text encoder durante la carga.
 
     Medido en la RTX 5070: ese forward cuesta ~40 s (init de kernels de
@@ -279,6 +329,7 @@ def _warmup_text_encoder(pipe, te, torch) -> None:
     tokenizer = getattr(pipe, "tokenizer", None)
     if not callable(tokenizer):
         return
+    dev = dev or _device_for(True)
     t0 = time.time()
     try:
         largos = [64]
@@ -291,7 +342,7 @@ def _warmup_text_encoder(pipe, te, torch) -> None:
             max_length=min(largos),
             truncation=True,
             return_tensors="pt",
-        ).input_ids.to("cuda")
+        ).input_ids.to(dev.torch_device)
         with torch.no_grad():
             te(ids)
     except Exception as exc:  # noqa: BLE001 — best-effort
@@ -310,15 +361,26 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
         WanPipeline,
     )
 
-    dtype = getattr(torch, dtype_str)
+    dev = _device_for(use_gpu)
     lower = repo.lower()
     wan = "wan" in lower
+    pedido = dtype_str
     if use_gpu and wan and dtype_str != "bfloat16":
         # Wan en fp16 satura al decodificar clips largos (5 bits de exponente
         # contra los 8 de bf16) y el video sale lavado. En Blackwell bf16 corre
         # a la misma velocidad, así que no cuesta tiempo.
-        dtype = torch.bfloat16
+        pedido = "bfloat16"
         logger.info("[Factory] Wan en GPU con bfloat16 (pedido %s)", dtype_str)
+    if use_gpu and wan and dev.backend != "cuda":
+        # El UMT5-XXL en fp16 pide ~10,6 GB y sólo entra cuantizado a 4-bit, y
+        # bitsandbytes 4-bit no tiene kernels de XPU. Mejor decirlo claro que
+        # fallar a mitad de la carga en una Arc.
+        raise RuntimeError(
+            f"Wan no está soportado en {dev.display}: el text encoder necesita "
+            "cuantización 4-bit (bitsandbytes sólo corre en CUDA). En esta "
+            "máquina funcionan SD-1.5 y SD-Turbo."
+        )
+    dtype = getattr(torch, device_mod.dtype_name(pedido, dev))
     if "ltx" in lower:
         cls = LTXPipeline
     elif "wan" in lower:
@@ -330,9 +392,11 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     else:
         raise ValueError(f"familia de video no soportada para {repo}")
 
-    logger.info("[Factory] Cargando video %s (gpu=%s, %s)...", repo, use_gpu, dtype_str)
+    logger.info(
+        "[Factory] video %s · %s (pedido %s)", repo, dev.describe(), dtype_str
+    )
     kwargs = {"torch_dtype": dtype}
-    if use_gpu and "wan" in lower:
+    if use_gpu and wan:
         # El UMT5-XXL en fp16 pide ~10,6 GB: sin 4-bit Wan-1.3B no entra en 8.
         try:
             import bitsandbytes  # noqa: F401
@@ -363,7 +427,7 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     if use_gpu:
         # La cuantización deja ~5 GB de área de trabajo en el allocator: si no
         # se devuelve, el job arranca paginando pesos a RAM del sistema.
-        torch.cuda.empty_cache()
+        device_mod.empty_cache(dev)
         if wan:
             # El VAE en fp16 desborda al decodificar un clip largo: los latentes
             # de 81 frames tienen picos fuera de rango y el frame sale lavado.
@@ -373,14 +437,14 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
                 vae.to(torch.float32)
                 logger.info("[Factory] VAE de %s en fp32 para el decode", repo)
         if "quantization_config" in kwargs:
-            _offload_sequentially(pipe, dtype)
+            _offload_sequentially(pipe, dtype, dev)
             logger.info(
                 "[Factory] %s por etapas: text encoder 4-bit, transformer y VAE "
                 "entran y salen de VRAM",
                 repo,
             )
         else:
-            pipe.enable_model_cpu_offload()
+            _enable_offload(pipe, dev)
     else:
         pipe.enable_attention_slicing()
         _enable_vae_opt(pipe, "enable_slicing", "enable_vae_slicing")
@@ -428,13 +492,7 @@ def release_vram(pipe) -> None:
                     iniciar(module)
         except Exception:  # noqa: BLE001 — limpieza best-effort
             pass
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001
-        pass
+    device_mod.empty_cache()
 
 
 def _get_pipeline(spec: ModelSpec, use_gpu: bool):
@@ -470,13 +528,7 @@ def _run_image(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
         report(min(step_index + 1, steps) / steps * 88.0, "GENERATING")
         return {}
 
-    generator = None
-    if req.seed:
-        import torch
-
-        generator = torch.Generator(
-            device="cuda" if _has_cuda() else "cpu"
-        ).manual_seed(req.seed)
+    generator = device_mod.generator(req.seed)
 
     kwargs = dict(
         prompt=req.prompt or "",
@@ -598,11 +650,9 @@ def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
         kwargs["negative_prompt"] = negative
     if req.seed:
         # Misma seed, mismo clip: sin esto cada job arranca de otros latentes.
-        import torch
-
-        kwargs["generator"] = torch.Generator(
-            device="cuda" if _has_cuda() else "cpu"
-        ).manual_seed(req.seed)
+        generador = device_mod.generator(req.seed)
+        if generador is not None:
+            kwargs["generator"] = generador
 
     t_pipe = time.time()
     result = pipe(**kwargs)

@@ -52,9 +52,18 @@ async def test_full_stream_over_real_grpc(grpc_env):
 
 async def test_enhance_and_telemetry_over_grpc(grpc_env, monkeypatch):
     _, stub = grpc_env
-    # El servidor corre en este proceso: se fija "sin CUDA" para no depender
-    # de si la máquina de turno tiene GPU.
-    monkeypatch.setattr("vram_manager.HAS_TORCH", False)
+    # El servidor corre en este proceso: se fija "sin acelerador" (CPU) para
+    # no depender de si la máquina de turno tiene GPU, Arc o Ryzen.
+    import device as device_mod
+
+    monkeypatch.setattr(
+        device_mod, "_OVERRIDE",
+        device_mod.DeviceInfo(
+            backend="cpu", torch_device="cpu", name="CPU de prueba",
+            vendor="desconocido", total_mb=16384, free_mb=8192,
+            precision="float32", reason="forzado en el test", fixed=True,
+        ),
+    )
 
     enh = await stub.EnhancePrompt(
         inference_pb2.PromptEnhanceRequest(
@@ -65,7 +74,10 @@ async def test_enhance_and_telemetry_over_grpc(grpc_env, monkeypatch):
     assert enh.rationale
 
     tel = await stub.GetGpuTelemetry(inference_pb2.GpuTelemetryRequest())
-    assert tel.device_name == "CPU / No CUDA"
+    assert tel.device_name == "CPU de prueba (CPU, fp32)"
+    # Sin acelerador la telemetría reporta la RAM del equipo, no 0 GB.
+    assert tel.total_vram_mb == 16384
+    assert tel.free_vram_mb == 8192
 
 
 async def test_remote_cancellation_via_grpc(grpc_env):

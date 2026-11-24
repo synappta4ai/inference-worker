@@ -45,6 +45,29 @@ def check_python() -> None:
         check("Python", BAD, f"{v.major}.{v.minor} — necesitás 3.11+")
 
 
+def check_device() -> None:
+    """Qué dispositivo va a usar el worker: CUDA, XPU (Arc) o CPU.
+
+    En una iGPU Ryzen el worker corre en CPU en fp32: SD-Turbo tarda ~1 min por
+    imagen, pero funciona. En una Intel Arc, si falta el driver, `torch.xpu`
+    queda en False y también cae a CPU: este chequeo lo dice antes de generar.
+    """
+    try:
+        import device  # el worker está en cwd durante el doctor
+
+        info = device.current()
+    except Exception as exc:  # noqa: BLE001 — sin torch igual se instala
+        check("dispositivo", WARN, f"no pude detectarlo: {exc}")
+        return
+    if info.is_gpu:
+        check("dispositivo", OK, info.describe())
+        return
+    memoria = f"{info.total_mb / 1024:.0f} GB de RAM" if info.total_mb else "RAM ?"
+    check("dispositivo", WARN,
+          f"{info.name} → CPU en {info.pretty_precision} ({memoria}): "
+          "SD-Turbo y SD-1.5 funcionan, video no es viable")
+
+
 def check_gpu() -> None:
     if shutil.which("nvidia-smi") is None:
         check("GPU NVIDIA", WARN,
@@ -180,7 +203,7 @@ def check_catalog() -> None:
 
 def main() -> int:
     print("Synapta Worker — diagnóstico\n" + "=" * 40)
-    for fn in (check_python, check_gpu, check_ram, check_disk,
+    for fn in (check_python, check_gpu, check_device, check_ram, check_disk,
                check_ports, check_pairing, check_catalog):
         fn()
     icon = {OK: "✔", WARN: "⚠", BAD: "✘"}

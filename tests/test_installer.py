@@ -861,6 +861,73 @@ def test_update_sin_worker_instalado_falla_claro(tmp_path):
         core.update(tmp_path)
 
 
+def test_detecta_intel_arc_para_el_torch_xpu(monkeypatch):
+    """Sólo Arc / Iris Xe: las Intel UHD viejas no tienen backend XPU."""
+    monkeypatch.setattr(
+        core, "video_controllers",
+        lambda: ["Intel(R) Arc(TM) A770 Graphics", "Intel(R) UHD Graphics 770"],
+    )
+    assert core.has_intel_xpu() is True
+
+    monkeypatch.setattr(
+        core, "video_controllers",
+        lambda: ["NVIDIA GeForce RTX 4060 Laptop GPU", "Intel(R) UHD Graphics"],
+    )
+    assert core.has_intel_xpu() is False
+
+    monkeypatch.setattr(core, "video_controllers",
+                        lambda: ["Intel(R) Iris(R) Xe Graphics"])
+    assert core.has_intel_xpu() is True
+
+
+def test_install_torch_xpu_usa_el_indice_xpu(tmp_path, monkeypatch):
+    # El worker ya tiene un torch cpu: hay que forzar la reinstalación, porque
+    # pip considera "satisfecha" una versión más nueva del wheel de PyPI.
+    llamadas = []
+    monkeypatch.setattr(core, "index_torch_version", lambda py, wd, idx: "2.13.0")
+    monkeypatch.setattr(core, "torch_version", lambda py, wd: "2.13.0")
+    monkeypatch.setattr(core, "run", lambda cmd, **kw: llamadas.append(cmd) or 0)
+    monkeypatch.setattr(core, "run_capture", lambda cmd, **kw: (0, ["True"]))
+
+    version = core.install_torch_xpu(tmp_path / "python", tmp_path)
+
+    assert version == "2.13.0"
+    pip = [c for c in llamadas if "install" in c]
+    assert pip, llamadas
+    texto = " ".join(str(x) for x in pip[0])
+    assert "download.pytorch.org/whl/xpu" in texto
+    assert "--force-reinstall" in texto
+    assert "torch==2.13.0" in texto
+
+
+def test_install_torch_xpu_falla_si_no_ve_la_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "index_torch_version", lambda py, wd, idx: "2.13.0")
+    monkeypatch.setattr(core, "torch_version", lambda py, wd: "2.13.0")
+    monkeypatch.setattr(core, "run", lambda cmd, **kw: 0)
+    monkeypatch.setattr(core, "run_capture", lambda cmd, **kw: (0, ["False"]))
+
+    with pytest.raises(RuntimeError, match="no ve la GPU Intel"):
+        core.install_torch_xpu(tmp_path / "python", tmp_path)
+
+
+def test_install_deps_prefiere_xpu_cuando_no_hay_nvidia(tmp_path, monkeypatch):
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    (worker / "requirements.txt").write_text("grpcio\n", encoding="utf-8")
+    pedido = {}
+    monkeypatch.setattr(core, "has_nvidia", lambda: False)
+    monkeypatch.setattr(core, "has_intel_xpu", lambda: True)
+    monkeypatch.setattr(
+        core, "install_torch_xpu",
+        lambda py, wd: pedido.setdefault("xpu", "2.13.0"),
+    )
+    monkeypatch.setattr(core, "run", lambda cmd, **kw: 0)
+
+    core.install_deps(tmp_path / "python", tmp_path)
+
+    assert pedido["xpu"] == "2.13.0"
+
+
 def test_stop_sin_arbol_no_mata_al_llamador(tmp_path, monkeypatch):
     """`tree=False` evita el `/T` que mataba al updater, hijo del worker."""
     if os.name != "nt":

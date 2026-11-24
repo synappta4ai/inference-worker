@@ -57,6 +57,9 @@ EMBED_URL = (
 )
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+# Intel Arc: torch trae XPU nativo (Windows incluido) desde 2.5; Intel IPEX
+# está en EOL, así que el wheel oficial es este índice.
+TORCH_XPU_INDEX = "https://download.pytorch.org/whl/xpu"
 
 # Índices de wheels CUDA, del más nuevo al más viejo. Blackwell (RTX 50xx,
 # sm_120) necesita cu128 o superior: con cu124 torch no ve la GPU. El driver
@@ -334,6 +337,85 @@ def has_nvidia() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
+def video_controllers() -> list:
+    """Nombres de las GPUs visibles (WMI en Windows; [] si no se puede)."""
+    if os.name != "nt":
+        return []
+    rc, lines = run_capture(
+        ["powershell", "-NoProfile", "-Command",
+         "(Get-CimInstance Win32_VideoController).Name"],
+        timeout=60,
+    )
+    if rc != 0:
+        return []
+    return [line.strip() for line in lines if line.strip()]
+
+
+def has_intel_xpu() -> bool:
+    """true si hay una Intel Arc / Iris Xe, que torch maneja como XPU.
+
+    Las Intel UHD viejas no soportan XPU: se quedan en CPU, que es lo que el
+    worker elige solo cuando `torch.xpu.is_available()` da false.
+    """
+    for nombre in video_controllers():
+        low = nombre.lower()
+        if "intel" not in low:
+            continue
+        if "arc" in low or "iris xe" in low or "iris(r) xe" in low:
+            return True
+    return False
+
+
+def index_torch_version(py: Path, workdir: Path, index: str) -> str:
+    """Versión de torch que ofrece el índice (cu130, xpu, …), o ""."""
+    rc, lines = run_capture(
+        [py, "-m", "pip", "index", "versions", "torch",
+         "--index-url", f"https://download.pytorch.org/whl/{index}"],
+        cwd=workdir, timeout=180)
+    if rc != 0:
+        return ""
+    for line in lines:
+        text = line.strip()
+        if text.lower().startswith("torch ("):
+            return text[text.find("(") + 1:text.find(")")].strip()
+    return ""
+
+
+def install_torch_xpu(py: Path, workdir: Path) -> str:
+    """Instala el build XPU de torch (Intel Arc) y verifica que vea la GPU.
+
+    Se instala la versión exacta del índice con --force-reinstall: `--upgrade`
+    no cambia un 2.15.0+cpu ya presente (pip lo ve como "satisfecho").
+    """
+    version = index_torch_version(py, workdir, "xpu")
+    if not version:
+        raise RuntimeError(
+            "el índice XPU de PyTorch no ofrece torch para este Python: "
+            "actualizá el Python del instalador o usá una GPU NVIDIA")
+    logger.info("instalando torch %s (Intel XPU) …", version)
+    rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
+              "--force-reinstall", f"torch=={version}",
+              "--index-url", TORCH_XPU_INDEX,
+              "--extra-index-url", "https://pypi.org/simple"],
+             cwd=workdir, timeout=None)
+    if rc != 0:
+        raise RuntimeError(
+            "falló la instalación del torch XPU (Intel Arc): revisá la "
+            "conexión y reintentá")
+    installed = torch_version(py, workdir) or version
+    rc, lines = run_capture(
+        [py, "-c", "import torch; print(torch.xpu.is_available())"],
+        cwd=workdir, timeout=120)
+    salida = (lines[-1].strip() if lines else "")
+    if rc != 0 or salida not in ("True", "False") or salida == "False":
+        raise RuntimeError(
+            f"torch {installed} quedó instalado pero no ve la GPU Intel "
+            "(torch.xpu.is_available() = False): instalá el driver de Intel "
+            "Arc más nuevo desde intel.com y reintentá")
+    logger.info("torch %s (XPU) instalado ✓", installed)
+    return installed
+
+
 def driver_version() -> Optional[float]:
     """Versión del driver NVIDIA como número (616.87), o None si no se sabe."""
     try:
@@ -521,13 +603,24 @@ def install_deps(py: Path, workdir: Path) -> None:
 
     extra: list = []
     gpu = has_nvidia()
-    logger.info("GPU NVIDIA: %s", "sí" if gpu else "no → torch cpu")
+    xpu = (not gpu) and has_intel_xpu()
+    logger.info(
+        "GPU NVIDIA: %s · Intel XPU: %s",
+        "sí" if gpu else "no", "sí" if xpu else "no",
+    )
+    if not gpu and not xpu:
+        logger.info("sin acelerador → torch cpu (SD-1.5/SD-Turbo corren en CPU)")
     if gpu:
         version, index = install_torch(py, workdir)
         constraints = workdir / "torch-constraints.txt"
         constraints.write_text(f"torch=={version}\n", encoding="utf-8")
         extra = ["-c", str(constraints),
                  "--extra-index-url", f"https://download.pytorch.org/whl/{index}"]
+    elif xpu:
+        version = install_torch_xpu(py, workdir)
+        constraints = workdir / "torch-constraints.txt"
+        constraints.write_text(f"torch=={version}\n", encoding="utf-8")
+        extra = ["-c", str(constraints), "--extra-index-url", TORCH_XPU_INDEX]
     else:
         rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
                   "--upgrade", "torch", "--index-url", TORCH_CPU_INDEX],

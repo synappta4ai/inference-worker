@@ -266,6 +266,61 @@ class TestVideoMemoryTweaks:
         diffusion_factory._enable_vae_opt(object(), "enable_tiling")
 
 
+def _entorno_diffusers(monkeypatch):
+    """Falsos de diffusers/accelerate y la CUDA falsa del entorno de carga."""
+    estado = {"offload": []}
+    # La máquina de tests no tiene por qué tener GPU: se fija una CUDA
+    # falsa de 8 GB para ejercitar la rama de acelerador de forma estable.
+    import device as device_mod
+
+    monkeypatch.setattr(
+        device_mod, "_OVERRIDE",
+        device_mod.DeviceInfo(
+            backend="cuda", torch_device="cuda:0", name="GPU de prueba",
+            vendor="NVIDIA", total_mb=8192, free_mb=7000,
+            precision="float16", reason="test", fixed=True,
+        ),
+    )
+
+    class _Base:
+        @classmethod
+        def from_pretrained(cls, repo, **kwargs):
+            estado["repo"] = repo
+            estado["kwargs"] = kwargs
+            return estado["pipe"]
+
+    modulo = types.ModuleType("diffusers")
+    for nombre in (
+        "CogVideoXPipeline",
+        "HunyuanVideoPipeline",
+        "LTXPipeline",
+        "WanPipeline",
+        "FluxPipeline",
+        "StableDiffusionPipeline",
+        "StableDiffusionXLPipeline",
+    ):
+        setattr(modulo, nombre, type(nombre, (_Base,), {}))
+
+    quant = types.ModuleType("diffusers.quantizers")
+
+    class PipelineQuantizationConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            estado["quant"] = kwargs
+
+    quant.PipelineQuantizationConfig = PipelineQuantizationConfig
+
+    monkeypatch.setitem(sys.modules, "diffusers", modulo)
+    monkeypatch.setitem(sys.modules, "diffusers.quantizers", quant)
+    monkeypatch.setattr("model_ops.require_weights", lambda repo: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        "accelerate.cpu_offload_with_hook",
+        lambda module, device=None: estado["offload"].append(module),
+    )
+    return estado
+
+
 class TestGpuLoadPaths:
     """Cada ruta de carga (`image`/`video` x `use_gpu`) toma su decisión.
 
@@ -276,46 +331,7 @@ class TestGpuLoadPaths:
 
     @pytest.fixture
     def entorno(self, monkeypatch):
-        """Falsos de diffusers/accelerate y el pipeline que devolverá la carga."""
-        estado = {"offload": []}
-
-        class _Base:
-            @classmethod
-            def from_pretrained(cls, repo, **kwargs):
-                estado["repo"] = repo
-                estado["kwargs"] = kwargs
-                return estado["pipe"]
-
-        modulo = types.ModuleType("diffusers")
-        for nombre in (
-            "CogVideoXPipeline",
-            "HunyuanVideoPipeline",
-            "LTXPipeline",
-            "WanPipeline",
-            "FluxPipeline",
-            "StableDiffusionPipeline",
-            "StableDiffusionXLPipeline",
-        ):
-            setattr(modulo, nombre, type(nombre, (_Base,), {}))
-
-        quant = types.ModuleType("diffusers.quantizers")
-
-        class PipelineQuantizationConfig:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                estado["quant"] = kwargs
-
-        quant.PipelineQuantizationConfig = PipelineQuantizationConfig
-
-        monkeypatch.setitem(sys.modules, "diffusers", modulo)
-        monkeypatch.setitem(sys.modules, "diffusers.quantizers", quant)
-        monkeypatch.setattr("model_ops.require_weights", lambda repo: None)
-        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-        monkeypatch.setattr(
-            "accelerate.cpu_offload_with_hook",
-            lambda module, device=None: estado["offload"].append(module),
-        )
-        return estado
+        return _entorno_diffusers(monkeypatch)
 
     @staticmethod
     def _pipe_imagen(entorno):
@@ -861,3 +877,114 @@ class TestMockArtifacts:
             # WAV real: cabecera RIFF/WAVE + bloque fmt PCM.
             assert data[8:12] == b"WAVE"
             assert data[12:16] == b"fmt "
+
+
+class TestDevicePlacement:
+    """La factoría carga según el dispositivo real: XPU, CUDA o CPU.
+
+    Es lo que hace que SD-1.5 / SD-Turbo corran en una Intel Arc (`xpu`) y en
+    una iGPU Ryzen (`cpu`, fp32) en vez de morir buscando CUDA.
+    """
+
+    @pytest.fixture
+    def entorno(self, monkeypatch):
+        return _entorno_diffusers(monkeypatch)
+
+    @staticmethod
+    def _pipe(entorno, *, acepta_device=True):
+        class _Pipe:
+            def __init__(self):
+                self.offloaded = False
+                self.offload_device = None
+                self.sliced = False
+                self.device = None
+
+            def enable_model_cpu_offload(self, device=None):
+                if not acepta_device and device is not None:
+                    raise TypeError(
+                        "enable_model_cpu_offload() got an unexpected keyword "
+                        "argument 'device'"
+                    )
+                self.offloaded = True
+                self.offload_device = device
+
+            def enable_attention_slicing(self):
+                self.sliced = True
+
+            def to(self, device):
+                self.device = device
+
+        entorno["pipe"] = _Pipe()
+        return entorno["pipe"]
+
+    def _override(self, monkeypatch, backend, torch_device, precision="float16"):
+        import device as device_mod
+
+        monkeypatch.setattr(
+            device_mod, "_OVERRIDE",
+            device_mod.DeviceInfo(
+                backend=backend, torch_device=torch_device, name=f"{backend} test",
+                vendor="Intel" if backend == "xpu" else "NVIDIA",
+                total_mb=8192, free_mb=7000, precision=precision, fixed=True,
+            ),
+        )
+
+    def test_xpu_offloadea_al_device_real(self, entorno, monkeypatch):
+        self._override(monkeypatch, "xpu", "xpu:0")
+        pipe = self._pipe(entorno)
+
+        diffusion_factory._load_image_pipeline(
+            "stabilityai/sd-turbo", True, "float16"
+        )
+
+        assert pipe.offloaded is True
+        # Sin `device=` accelerate asume CUDA y en una Arc explota.
+        assert pipe.offload_device == "xpu:0"
+        assert entorno["kwargs"]["torch_dtype"] == torch.float16
+
+    def test_xpu_sin_soporte_de_device_deja_el_pipeline_residente(
+        self, entorno, monkeypatch
+    ):
+        self._override(monkeypatch, "xpu", "xpu:0")
+        pipe = self._pipe(entorno, acepta_device=False)
+
+        diffusion_factory._load_image_pipeline(
+            "stabilityai/sd-turbo", True, "float16"
+        )
+
+        assert pipe.device == "xpu:0"
+
+    def test_cpu_carga_en_fp32_y_no_toca_cuda(self, entorno, monkeypatch):
+        self._override(monkeypatch, "cpu", "cpu", precision="float32")
+        pipe = self._pipe(entorno)
+
+        diffusion_factory._load_image_pipeline(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", False, "float16"
+        )
+
+        assert entorno["kwargs"]["torch_dtype"] == torch.float32
+        assert pipe.sliced is True
+        assert pipe.offloaded is False
+
+    def test_video_xpu_usa_offload_de_modelos(self, entorno, monkeypatch):
+        self._override(monkeypatch, "xpu", "xpu:0")
+        pipe = self._pipe(entorno)
+
+        diffusion_factory._load_video_pipeline(
+            "Lightricks/LTX-Video", True, "float16"
+        )
+
+        assert pipe.offloaded is True
+        assert pipe.offload_device == "xpu:0"
+
+    def test_wan_en_xpu_falla_con_mensaje_claro(self, entorno, monkeypatch):
+        """Wan necesita 4-bit (sólo CUDA): mejor decirlo antes de cargar."""
+        self._override(monkeypatch, "xpu", "xpu:0")
+        self._pipe(entorno)
+
+        with pytest.raises(RuntimeError, match="Wan no está soportado"):
+            diffusion_factory._load_video_pipeline(
+                "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", True, "float16"
+            )
+
+        assert "kwargs" not in entorno

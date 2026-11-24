@@ -37,6 +37,8 @@ import time
 import traceback
 from types import SimpleNamespace
 
+import device as device_mod
+
 # Campos del proto que usan los runners de la factoría.
 _FIELDS = ("job_id", "prompt", "negative_prompt", "width", "height",
            "num_frames", "fps", "seed")
@@ -65,25 +67,13 @@ def _rss_gb() -> float:
 
 
 def _reset_vram_peak() -> None:
-    """Reinicia el contador de pico de VRAM (sólo GPU)."""
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-    except Exception:  # noqa: BLE001 — telemetría best-effort
-        pass
+    """Reinicia el contador de pico del dispositivo (VRAM en CUDA/XPU)."""
+    device_mod.reset_peak()
 
 
 def _vram_peak_gb() -> float:
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return 0.0
-        return torch.cuda.max_memory_allocated() / 1024**3
-    except Exception:  # noqa: BLE001
-        return 0.0
+    """Pico de memoria del dispositivo en GB (0 en CPU)."""
+    return device_mod.peak_mb() / 1024
 
 
 def _stdin_loop(commands: "queue.Queue[dict]", state: dict) -> None:
@@ -204,6 +194,7 @@ def _run_job(factory, spec, job: dict, cancel: threading.Event) -> None:
 def main() -> int:
     global _USE_GPU
 
+
     # Los `logger.info` del factory (tiempos de encode y de paso) van a
     # stderr y terminan en worker.log; sin nivel configurado se descartan.
     logging.basicConfig(
@@ -228,9 +219,11 @@ def main() -> int:
     from engines import diffusion_factory as factory  # tardío: importa torch
     from engines.base import ModelSpec
 
-    # "auto" deja la decisión acá: así el worker padre nunca importa torch
-    # (300 MB de RSS que el guardia de memoria terminaría contando).
-    _USE_GPU = factory._has_cuda() if gpu_arg == "auto" else gpu_arg == "1"
+    # "auto" deja la decisión acá: CUDA si hay NVIDIA, XPU si hay Intel Arc,
+    # y CPU (fp32) si sólo hay una iGPU Ryzen, que no tiene backend en torch.
+    dev = device_mod.current(use_accel=gpu_arg != "0")
+    _USE_GPU = dev.is_gpu if gpu_arg == "auto" else gpu_arg == "1"
+    _log(f"[Host] dispositivo: {dev.describe()}")
 
     spec = ModelSpec(**spec_dict)
     commands: "queue.Queue[dict]" = queue.Queue()

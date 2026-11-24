@@ -56,14 +56,16 @@ def test_cpu_uses_real_weights_size(monkeypatch):
         _check_memory_before_load(_spec(6), use_gpu=False)
 
     msg = str(exc.value)
-    assert "necesita ~28.4 GB de RAM" in msg  # 26.95 + 1.5 de trabajo
+    # 26.95 x 2 (en CPU se corre en fp32) + 1.5 de trabajo
+    assert "necesita ~55.4 GB de RAM" in msg
     assert "26.9 GB de pesos en disco" in msg
     assert "22.0 GB libres" in msg
 
 
 def test_allows_weights_that_really_fit(monkeypatch):
     _fake_available(monkeypatch, 8)
-    _fake_weights(monkeypatch, 4.0)  # SD-1.5
+    # 3 GB en disco → 6 GB en fp32 + 1.5 de trabajo = 7.5 GB: entra en 8.
+    _fake_weights(monkeypatch, 3.0)
 
     _check_memory_before_load(_spec(4), use_gpu=False)
 

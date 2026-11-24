@@ -65,15 +65,33 @@ engines/worker_host.py ─────── hijo aislado: carga los pesos y gen
 - **Generación de Video:** Ejecuta pipelines de difusión como **Wan 2.1 (T2V/I2V 14B)**, **MiniMax H3**, **LTX-Video 2.5** y **Hunyuan**.
 - **Generación de Imagen:** Pipeline de **Flux 2 Klein 9B**, Krea y Qwen Image.
 - **Audio y Voz:** Transcripción/diarización con **Whisper**, generación musical con **YuE2** y clonación de voz con **Seed-VC**.
-- **Gestión de VRAM ([`vram_manager.py`](vram_manager.py)):** Telemetría continua de memoria de GPU y liberación proactiva con `torch.cuda.empty_cache()` para prevenir errores de _Out of Memory (OOM)_.
+- **Dispositivo abstracto ([`device.py`](device.py)):** CUDA (NVIDIA), XPU (Intel Arc) o CPU (iGPU Ryzen / Intel UHD), con la VRAM y la precisión de cada caso resueltas en un solo lugar.
+- **Gestión de VRAM ([`vram_manager.py`](vram_manager.py)):** Telemetría continua de memoria del dispositivo y liberación proactiva (`empty_cache` de CUDA o XPU) para prevenir errores de _Out of Memory (OOM)_.
 
 ---
 
 ## 🖥️ Requisitos de Hardware
 
-- **GPU:** NVIDIA con arquitectura Ampere, Ada Lovelace o Blackwell (RTX 3060 12GB mínimo; **RTX 3090 / 4090 de 24 GB VRAM recomendada** para video 1080p y modelos 14B).
-- **Drivers:** NVIDIA Driver 535+ (Linux) o 550+ (Windows) con soporte CUDA 12.1+ o CUDA 13.
-- **Almacenamiento:** Disco SSD NVMe (los pesos de modelos de video rondan entre 10 GB y 40 GB).
+El worker **no asume CUDA**: `device.py` elige el mejor backend disponible y cada caso tiene su VRAM y su precisión.
+
+| Dispositivo | Backend | Precisión | Modelos viables |
+|---|---|---|---|
+| NVIDIA (3060 / 4060 / 5050 / 5070) | `cuda` | fp16; bf16 en Ampere+ | todo el catálogo |
+| Intel Arc (A/B-Series, Core Ultra) | `xpu` | fp16 / bf16 (XMX) | imagen; video sólo si entra el text encoder |
+| iGPU Ryzen / Intel UHD | `cpu` | **fp32** (half en CPU no es fiable) | SD-Turbo y SD-1.5 (512 px, ~1 min/imagen) |
+
+- **GPU NVIDIA:** Ampere, Ada o Blackwell (RTX 3060 12 GB mínimo; 24 GB recomendada para video 1080p y modelos 14B). Driver 550+ en Windows / 535+ en Linux.
+- **Intel Arc:** `torch` con XPU (`pip install torch --index-url https://download.pytorch.org/whl/xpu`; el instalador lo hace solo si ve una Arc) + driver de Intel al día. Intel IPEX ya está en EOL: el soporte vive en PyTorch.
+- **iGPU Ryzen:** no tiene backend en PyTorch, así que corre en CPU en fp32 con attention slicing y VAE tiling. Sirve para SD-Turbo/SD-1.5, no para video.
+- **Forzar un backend:** `BM_DEVICE=cuda|xpu|cpu` (y `BM_CPU_DTYPE=bfloat16` en Zen 4 / AMX).
+- **Almacenamiento:** Disco SSD NVMe (los pesos de video rondan entre 10 GB y 40 GB).
+
+El detalle real de cada máquina sale en el log al arrancar y en el diagnóstico:
+
+```
+[VRAMManager] dispositivo: Intel(R) Arc(TM) A770 (XPU, fp16) · 15.9 GB de VRAM (13.2 GB libres) · Intel XPU disponible
+[VRAMManager] dispositivo: AMD Ryzen 7 7840U (CPU, fp32) · 31.7 GB de RAM (18.4 GB libres) · sin acelerador: torch no reporta CUDA ni XPU
+```
 
 ---
 

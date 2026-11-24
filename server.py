@@ -135,10 +135,11 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         from engines.v1_bridge import is_available
 
         tel = self.vram.get_telemetry()
-        cuda = bool(tel.get("cuda_available")) or "cpu" not in tel.get("device_name", "cpu").lower()
+        # `cuda_available` del proto ahora significa "hay acelerador": CUDA,
+        # XPU o ROCm. El front sólo lo usa para habilitar el panel de GPU.
         resp = inference_pb2.ListModelsResponse(
             device_name=tel["device_name"],
-            cuda_available=cuda,
+            cuda_available=bool(tel.get("is_gpu")),
         )
         for m in registry.list_models():
             state = self.ops.snapshot(m["id"])
