@@ -490,6 +490,24 @@ def test_agent_launches_updater_and_defers_ack(monkeypatch, tmp_path):
     assert ack["id"] == "u-1"
 
 
+def test_agent_passes_payload_hash_to_updater(monkeypatch, tmp_path):
+    """El hash viaja al updater: verifica lo bajado antes de parar el worker."""
+    from bridge import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "installed_workdir", lambda: str(tmp_path))
+    lanzado: dict = {}
+    monkeypatch.setattr(agent_mod, "spawn_detached",
+                        lambda cmd, cwd: lanzado.update(cmd=cmd, cwd=cwd))
+    ag = _agent()
+    hash_ = "ab" * 32
+
+    assert ag._start_remote_update({"id": "u-1", "url": "https://front/x.zip",
+                                    "sha256": hash_}) is True
+    cmd = lanzado["cmd"]
+    assert "--sha256" in cmd
+    assert cmd[cmd.index("--sha256") + 1] == hash_
+
+
 def test_agent_update_waits_for_running_job(monkeypatch):
     """Reiniciar con un job a medio generar lo perdería: el pedido espera."""
     from bridge import agent as agent_mod

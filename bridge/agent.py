@@ -537,6 +537,10 @@ class Agent:
             return False
         request_id = str(requested.get("id") or "").strip()
         url = str(requested.get("url") or "").strip()
+        # Hash del payload que calculó el panel: el updater verifica lo bajado
+        # contra él antes de detener el worker, así un zip truncado o cambiado
+        # en el camino no deja la máquina sin código.
+        sha256 = str(requested.get("sha256") or "").strip()
         updater = os.path.join(WORKER_ROOT, "scripts", "update_worker.py")
         if not os.path.isfile(updater):
             logger.error("[bridge] no encuentro %s: no puedo actualizar", updater)
@@ -551,6 +555,8 @@ class Agent:
         cmd = [sys.executable, updater]
         if url:
             cmd += ["--url", url]
+        if sha256:
+            cmd += ["--sha256", sha256]
         if request_id:
             cmd += ["--id", request_id]
         if workdir:

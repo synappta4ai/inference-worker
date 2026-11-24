@@ -12,6 +12,7 @@ Salida:
   dist/SynaptaWorker-Setup.exe                      (onefile, sin consola)
   ../front-synapta/src/assets/worker/SynaptaWorker-Setup.exe   (--into-front)
   ../front-synapta/src/assets/worker/synapta-worker.zip        (--into-front)
+  ../front-synapta/src/assets/worker/synapta-worker.sha256     (--into-front)
 
 Antivirus (falsos positivos de Windows Defender): el .exe sale con --noupx
 porque empaquetar/comprimir el bootloader es una señal heurística típica.
@@ -25,6 +26,7 @@ El zip que se regenera acá es la descarga para máquinas sin Windows
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -85,12 +87,17 @@ def build(into_front: bool = False) -> Path:
         shutil.copy2(exe, FRONT_ASSETS / "SynaptaWorker-Setup.exe")
         zip_dest = FRONT_ASSETS / "synapta-worker.zip"
         core.build_payload(WORKER_ROOT, zip_dest)  # siempre fresco
+        # El panel manda este hash con el pedido de actualización y el agente
+        # verifica lo bajado contra él antes de detener el worker: tiene que
+        # salir del mismo .zip que se sirve, nunca de un valor escrito a mano.
+        zip_sha = hashlib.sha256(zip_dest.read_bytes()).hexdigest()
+        (FRONT_ASSETS / "synapta-worker.sha256").write_text(
+            zip_sha + "\n", encoding="utf-8")
+        print(f"→ hash del zip: {zip_sha}")
         print(f"→ copiado al front: {(FRONT_ASSETS / 'SynaptaWorker-Setup.exe').name}"
               f" ({(FRONT_ASSETS / 'SynaptaWorker-Setup.exe').stat().st_size // 1024} KB)")
         print(f"→ zip no-Windows regenerado: {zip_dest.name}"
               f" ({zip_dest.stat().st_size // 1024} KB)")
-
-    import hashlib
 
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()
     print(f"SHA-256: {digest}")
