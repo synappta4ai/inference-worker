@@ -55,4 +55,7 @@ Piezas:
 # 0.2.22: el agente atiende `requested_deletions` del heartbeat (borrar pesos
 # para liberar disco de una máquina emparejada) y confirma con
 # `completed_deletions`. Un back sin la cola simplemente manda la lista vacía.
-BRIDGE_VERSION = "0.2.22"
+# 0.2.23: la actualización ya no da por buena una versión si el proceso viejo
+# sigue escuchando en :50051 (worker sin worker.pid): verifica el puerto y
+# aborta antes de reemplazar archivos, o arranca y confirma el pid nuevo.
+BRIDGE_VERSION = "0.2.23"
