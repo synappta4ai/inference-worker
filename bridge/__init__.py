@@ -75,4 +75,6 @@ Piezas:
 # (descarga, hash, extracción, deps, arranque) y el worker relanzado lo manda en
 # su primer heartbeat. Antes el back deducía el fallo de un reloj de 5 minutos,
 # que marcaba «falló» mientras el worker esperaba legítimamente un job largo.
-BRIDGE_VERSION = "0.2.27"
+# 0.2.28: el pedido de actualización trae el sha256 del payload y el agente se
+# lo pasa al updater, que verifica lo bajado antes de detener el worker.
+BRIDGE_VERSION = "0.2.28"
