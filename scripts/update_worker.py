@@ -35,6 +35,19 @@ from core import (  # noqa: E402
 STATE_FILE = "update-state.json"
 
 
+def say(msg: str) -> None:
+    """print que no rompe el updater.
+
+    Corre desacoplado, sin consola: sys.stdout puede ser None (pythonw) y en
+    Windows cp1252 revienta con los "✓" (UnicodeEncodeError). Perder una
+    línea de log jamás debe abortar la actualización.
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:  # noqa: BLE001 — sólo es diagnóstico
+        pass
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -50,6 +63,10 @@ def write_state(workdir: Path, data: dict) -> None:
 
 
 def main() -> int:
+    try:  # consola cp1252 de Windows: los acentos y "✓" no deben romper nada
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — stdout puede no existir
+        pass
     ap = argparse.ArgumentParser(prog="update_worker")
     ap.add_argument("--url", required=True)
     ap.add_argument("--sha256", default="")
@@ -61,7 +78,7 @@ def main() -> int:
 
     def fail(msg: str) -> int:
         write_state(workdir, {"status": "failed", "error": msg})
-        print(f"✘ {msg}")
+        say(f"[x] {msg}")
         return 1
 
     tmp = workdir / "_update-download.zip"
@@ -78,12 +95,14 @@ def main() -> int:
             )
 
     try:
-        stop(workdir)
+        # Sin árbol: este proceso es hijo del worker y `/T` lo mataría a él.
+        stop(workdir, tree=False)
     except Exception as exc:
-        print(f"⚠ stop falló (ignorando): {exc}")
+        say(f"[!] stop falló (ignorando): {exc}")
 
     try:
         extract_payload(tmp, worker_dir(workdir))
+        tmp.unlink(missing_ok=True)
     except Exception as exc:
         return fail(f"extracción falló: {exc}")
 
@@ -105,7 +124,7 @@ def main() -> int:
         return fail(f"arranque falló: {exc}")
 
     write_state(workdir, {"status": "ok"})
-    print("✓ worker actualizado y corriendo")
+    say("worker actualizado y corriendo")
     return 0
 
 

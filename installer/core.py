@@ -927,7 +927,14 @@ def start(workdir: Optional[Path] = None, wait: float = 20.0) -> None:
                    GRPC_PORT, wait)
 
 
-def stop(workdir: Optional[Path] = None) -> None:
+def stop(workdir: Optional[Path] = None, tree: bool = True) -> None:
+    """Detiene el worker registrado en `worker.pid`.
+
+    `tree=False` lo mata solo a él, sin bajar por el árbol de procesos: el
+    updater (`scripts/update_worker.py`) corre como hijo del worker y con
+    `/T` se mataba a sí mismo a mitad de la actualización, dejando el worker
+    caído y sin estado.
+    """
     workdir = (workdir or default_dir()).expanduser().resolve()
     pidf = _pid_file(workdir)
     if not pidf.exists():
@@ -939,8 +946,10 @@ def stop(workdir: Optional[Path] = None) -> None:
         pid = 0
     if pid and _alive(pid):
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True)
+            cmd = ["taskkill", "/PID", str(pid), "/F"]
+            if tree:
+                cmd.insert(3, "/T")
+            subprocess.run(cmd, capture_output=True)
         else:
             os.kill(pid, 15)
         logger.info("worker (pid %d) detenido", pid)

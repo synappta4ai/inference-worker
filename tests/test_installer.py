@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import queue as queue_mod
+import sys
 import zipfile
 from pathlib import Path
 
@@ -858,6 +859,58 @@ def test_update_saltea_las_dependencias_si_no_cambiaron(tmp_path, monkeypatch):
 def test_update_sin_worker_instalado_falla_claro(tmp_path):
     with pytest.raises(RuntimeError, match="no está instalado"):
         core.update(tmp_path)
+
+
+def test_stop_sin_arbol_no_mata_al_llamador(tmp_path, monkeypatch):
+    """`tree=False` evita el `/T` que mataba al updater, hijo del worker."""
+    if os.name != "nt":
+        pytest.skip("taskkill es sólo Windows")
+    calls = []
+    monkeypatch.setattr(core, "_alive", lambda pid: True)
+    monkeypatch.setattr(core.subprocess, "run",
+                        lambda cmd, **kwargs: calls.append(cmd))
+    pidf = core._pid_file(tmp_path)
+    pidf.parent.mkdir(parents=True, exist_ok=True)
+    pidf.write_text("4321", encoding="utf-8")
+
+    core.stop(tmp_path, tree=False)
+
+    assert len(calls) == 1
+    assert "/T" not in calls[0] and "/F" in calls[0]
+    assert "4321" in calls[0]
+    assert not pidf.exists()
+
+
+def test_updater_sobrevive_a_consola_cp1252(tmp_path, monkeypatch):
+    """El updater no debe morir imprimiendo "✓" en una consola Windows."""
+    import importlib.util
+
+    repo = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "synapta_update_worker", repo / "scripts" / "update_worker.py")
+    uw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(uw)
+
+    monkeypatch.setattr(uw, "download_payload",
+                        lambda url, dest, timeout=60.0: Path(dest).write_bytes(b"PK\x05\x06"))
+    monkeypatch.setattr(uw, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "extract_payload", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "ensure_python", lambda *a, **k: tmp_path / "python.exe")
+    monkeypatch.setattr(uw, "ensure_pip", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "run_doctor", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "start", lambda *a, **k: None)
+    # consola cp1252 estricta: "✓" no se puede escribir
+    monkeypatch.setattr(sys, "stdout",
+                        io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    monkeypatch.setattr(sys, "argv", ["update_worker", "--url",
+                                      "http://x/worker.zip", "--dir", str(tmp_path)])
+
+    assert uw.main() == 0
+    state = json.loads((tmp_path / "update-state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "ok"
+    # el zip temporal no queda tirado
+    assert not (tmp_path / "_update-download.zip").exists()
 
 
 def test_gui_modelos_lista_y_habilita_acciones(tmp_path, monkeypatch):
