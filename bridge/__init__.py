@@ -43,4 +43,6 @@ Piezas:
 # con SD-Turbo, pensado para GPUs de 8-12 GB e iGPU/CPU.
 # 0.2.17: fuera Qwen-Image e HiDream-I1: la factoría solo carga sd15/sdxl/flux,
 # así que esos dos fallaban al cargar y solo ensuciaban la lista.
-BRIDGE_VERSION = "0.2.17"
+# 0.2.18: el payload vuelve a incluir `installer/` (el auto-update del worker
+# moría con ImportError) y el instalador suma ventana de modelos y actualización.
+BRIDGE_VERSION = "0.2.18"
