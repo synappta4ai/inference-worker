@@ -35,4 +35,6 @@ Piezas:
 # 0.2.13: el instalador descargable fija las versiones de las librerías (diffusers
 # 0.36 / transformers 4.57 / huggingface_hub 0.36) e instala torch CUDA con un
 # constraint, así pip ya no puede dejar un torch CPU en una máquina con GPU.
-BRIDGE_VERSION = "0.2.13"
+# 0.2.14: el video respeta el ratio pedido (`_video_dims` deriva width/height del
+# max_side del modelo en múltiplos de 32); antes un pedido 9:16 salía 832x480.
+BRIDGE_VERSION = "0.2.14"
