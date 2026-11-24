@@ -441,6 +441,44 @@ class TestGpuLoadPaths:
         # Y tras cargar el TE queda en RAM, no ocupando 5,5 GB ociosos.
         assert pipe.text_encoder.device == "cpu"
 
+    def test_wan_gpu_usa_bfloat16_y_decodifica_el_vae_en_fp32(
+        self, entorno, monkeypatch
+    ):
+        """fp16 satura al decodificar 81 frames: bf16 + VAE fp32."""
+        monkeypatch.setitem(
+            sys.modules, "bitsandbytes", types.ModuleType("bitsandbytes")
+        )
+        pipe = self._pipe_video(entorno)
+        pipe.vae = torch.nn.Linear(2, 2, dtype=torch.float16)
+
+        diffusion_factory._load_video_pipeline(
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", True, "float16"
+        )
+
+        # La spec pide float16, pero en GPU Wan se carga en bf16.
+        assert entorno["kwargs"]["torch_dtype"] is torch.bfloat16
+        assert (
+            entorno["quant"]["quant_kwargs"]["bnb_4bit_compute_dtype"]
+            is torch.bfloat16
+        )
+        assert pipe.vae.weight.dtype is torch.float32
+
+    def test_video_gpu_tambien_activa_el_tiling_del_vae(self, entorno):
+        """Sin tiling el decode de 81 frames no entra en 8 GB.
+
+        Medido: sin tiling el driver pagina (16 min sin devolver un frame, GPU
+        al 100 % a 33 W); con tiling y VAE fp32 el decode tarda 66,8 s con un
+        pico de 2,28 GB.
+        """
+        pipe = self._pipe_video(entorno)
+        pipe.vae = TestVideoMemoryTweaks._Vae()
+
+        diffusion_factory._load_video_pipeline(
+            "Lightricks/LTX-Video", True, "float16"
+        )
+
+        assert pipe.vae.tiling is True
+
     def test_offload_sequentially_castea_los_fp32_del_text_encoder(self):
         """bnb deja las FFN `wo` en fp32 y `te.to(dtype)` está bloqueado."""
 
@@ -722,6 +760,67 @@ class TestVideoDims:
         )
 
         assert (pipe.kwargs["width"], pipe.kwargs["height"]) == (480, 832)
+
+
+class TestVideoQuality:
+    """Calidad del clip: frames 4k+1 y negative prompt por defecto de Wan."""
+
+    class _Pipe:
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            frame = np.zeros((8, 8, 3), dtype=np.uint8)
+            return types.SimpleNamespace(frames=[np.stack([frame] * 4)])
+
+    @classmethod
+    def _correr(cls, tmp_path, spec_repo, negative="", num_frames=80):
+        pipe = cls._Pipe()
+        req = types.SimpleNamespace(
+            job_id="calidad", prompt="un gato astronauta",
+            num_frames=num_frames, fps=16, seed=0, negative_prompt=negative,
+            width=480, height=832,
+        )
+        spec = types.SimpleNamespace(
+            guidance_scale=5.0, max_side=480, repo=spec_repo
+        )
+        diffusion_factory._run_video(
+            pipe, req, spec, str(tmp_path), lambda *a, **k: None,
+            cancel=types.SimpleNamespace(is_set=lambda: False), steps=2,
+        )
+        return pipe.kwargs
+
+    @pytest.mark.parametrize(
+        ("pedido", "esperado"),
+        [(0, 49), (8, 9), (32, 33), (80, 81), (81, 81), (100, 101),
+         (257, 257), (400, 257)],
+    )
+    def test_num_frames_queda_en_4k_mas_1(self, pedido, esperado):
+        frames = diffusion_factory._video_frames(pedido)
+
+        assert frames == esperado
+        assert frames % 4 == 1
+
+    def test_wan_recibe_su_negative_prompt_por_defecto(self, tmp_path):
+        kwargs = self._correr(
+            tmp_path, "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        )
+
+        assert kwargs["negative_prompt"] == diffusion_factory._WAN_NEGATIVE_PROMPT
+        assert kwargs["num_frames"] == 81
+
+    def test_el_negative_prompt_del_job_gana_al_de_wan(self, tmp_path):
+        kwargs = self._correr(
+            tmp_path, "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", negative="borroso"
+        )
+
+        assert kwargs["negative_prompt"] == "borroso"
+
+    def test_otras_familias_no_reciben_el_negative_de_wan(self, tmp_path):
+        kwargs = self._correr(tmp_path, "Lightricks/LTX-Video")
+
+        assert "negative_prompt" not in kwargs
 
 
 class TestMockArtifacts:

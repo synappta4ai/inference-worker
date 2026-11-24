@@ -194,7 +194,7 @@ def _enable_vae_opt(pipe, *names: str) -> None:
             return
 
 
-def _offload_sequentially(pipe) -> None:
+def _offload_sequentially(pipe, dtype=None) -> None:
     """Uso secuencial de la VRAM: TE, transformer y VAE nunca conviven.
 
     Medido en la RTX 5070 (8 GB): con el pipeline entero residente el driver
@@ -220,9 +220,10 @@ def _offload_sequentially(pipe) -> None:
     # bnb cuantiza 144 capas a 4-bit pero deja el embedding (1,96 GB) y las FFN
     # `wo` en fp32 (24 x 0,16 GB; UMT5 las marca `_keep_in_fp32_modules`).
     # `te.to(dtype)` lo bloquea bnb, así que se castea parámetro por parámetro.
+    destino = dtype or torch.float16
     for prm in te.parameters():
         if prm.dtype == torch.float32:
-            prm.data = prm.data.half()
+            prm.data = prm.data.to(destino)
 
     _wrap_encode_prompt(pipe, te, torch)
 
@@ -311,6 +312,13 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
 
     dtype = getattr(torch, dtype_str)
     lower = repo.lower()
+    wan = "wan" in lower
+    if use_gpu and wan and dtype_str != "bfloat16":
+        # Wan en fp16 satura al decodificar clips largos (5 bits de exponente
+        # contra los 8 de bf16) y el video sale lavado. En Blackwell bf16 corre
+        # a la misma velocidad, así que no cuesta tiempo.
+        dtype = torch.bfloat16
+        logger.info("[Factory] Wan en GPU con bfloat16 (pedido %s)", dtype_str)
     if "ltx" in lower:
         cls = LTXPipeline
     elif "wan" in lower:
@@ -342,7 +350,7 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
             quant_kwargs={
                 "load_in_4bit": True,
                 "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": torch.float16,
+                "bnb_4bit_compute_dtype": dtype,
             },
             components_to_quantize=["text_encoder"],
         )
@@ -356,8 +364,16 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
         # La cuantización deja ~5 GB de área de trabajo en el allocator: si no
         # se devuelve, el job arranca paginando pesos a RAM del sistema.
         torch.cuda.empty_cache()
+        if wan:
+            # El VAE en fp16 desborda al decodificar un clip largo: los latentes
+            # de 81 frames tienen picos fuera de rango y el frame sale lavado.
+            # En fp32 son ~0,5 GB y va offloadeado, así que no quita VRAM.
+            vae = getattr(pipe, "vae", None)
+            if vae is not None:
+                vae.to(torch.float32)
+                logger.info("[Factory] VAE de %s en fp32 para el decode", repo)
         if "quantization_config" in kwargs:
-            _offload_sequentially(pipe)
+            _offload_sequentially(pipe, dtype)
             logger.info(
                 "[Factory] %s por etapas: text encoder 4-bit, transformer y VAE "
                 "entran y salen de VRAM",
@@ -368,6 +384,10 @@ def _load_video_pipeline(repo: str, use_gpu: bool, dtype_str: str):
     else:
         pipe.enable_attention_slicing()
         _enable_vae_opt(pipe, "enable_slicing", "enable_vae_slicing")
+    # Tiling también en GPU: sin él el decode de 81 frames se va de los 8 GB y
+    # el driver pagina (medido: 16 min sin devolver un solo frame, GPU al 100 %
+    # pero a 33 W). Se pierde algo de detalle en las costuras, pero es lo único
+    # que entra en una laptop de 8 GB.
     _enable_vae_opt(pipe, "enable_tiling", "enable_vae_tiling")
     return pipe
 
@@ -491,6 +511,28 @@ def _round_to_step(value: float, step: int = _VIDEO_DIM_STEP) -> int:
     return max(step, int(round(value / step)) * step)
 
 
+# Negative prompt oficial de Wan. Sin él el sampler no tiene nada que empuje
+# fuera de "imagen plana": los clips salen lavados (brillo medio 201/255) y
+# casi estáticos. Solo se usa cuando el job no manda uno propio.
+_WAN_NEGATIVE_PROMPT = (
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
+    "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
+    "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，"
+    "静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+)
+
+
+def _video_frames(value) -> int:
+    """`num_frames` en 4k+1, como espera el VAE temporal de Wan.
+
+    Comprime el tiempo 4:1 y agrega el frame inicial: con 80 (múltiplo de 16
+    "redondo") el último grupo de latentes queda incompleto y se decodifican
+    frames de relleno. 257 es el máximo que banca el modelo.
+    """
+    frames = max(8, min(int(value or 48), 257))
+    return max(5, min(4 * int(round((frames - 1) / 4)) + 1, 257))
+
+
 def _video_dims(req, spec: ModelSpec) -> tuple[int, int]:
     """Dimensiones del video a partir del ratio pedido (width/height del job).
 
@@ -516,7 +558,7 @@ def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
     import imageio
     import numpy as np
 
-    frames = max(8, min(int(req.num_frames or 48), 257))
+    frames = _video_frames(req.num_frames)
     fps = max(1, int(req.fps or 16))
 
     marca = {"t": time.time()}
@@ -533,8 +575,8 @@ def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
 
     width, height = _video_dims(req, spec)
     logger.info(
-        "[Factory] video %sx%s (pedido %sx%s, max_side %s)",
-        width, height, getattr(req, "width", 0) or "?",
+        "[Factory] video %sx%s con %s frames (pedido %sx%s, max_side %s)",
+        width, height, frames, getattr(req, "width", 0) or "?",
         getattr(req, "height", 0) or "?", getattr(spec, "max_side", 0) or "?",
     )
 
@@ -548,8 +590,12 @@ def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
     )
     if spec.guidance_scale:
         kwargs["guidance_scale"] = spec.guidance_scale
-    if (req.negative_prompt or "").strip():
-        kwargs["negative_prompt"] = req.negative_prompt
+    negative = (req.negative_prompt or "").strip()
+    if not negative and "wan" in str(getattr(spec, "repo", "")).lower():
+        negative = _WAN_NEGATIVE_PROMPT
+        logger.info("[Factory] negative prompt por defecto de Wan")
+    if negative:
+        kwargs["negative_prompt"] = negative
     if req.seed:
         # Misma seed, mismo clip: sin esto cada job arranca de otros latentes.
         import torch
