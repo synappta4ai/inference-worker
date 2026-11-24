@@ -41,4 +41,6 @@ Piezas:
 # defecto y `num_frames` en 4k+1 (el VAE temporal de Wan lo exige).
 # 0.2.16: catálogo sin modelos de prueba (SD-Tiny y los TTS/música `mock`) y
 # con SD-Turbo, pensado para GPUs de 8-12 GB e iGPU/CPU.
-BRIDGE_VERSION = "0.2.16"
+# 0.2.17: fuera Qwen-Image e HiDream-I1: la factoría solo carga sd15/sdxl/flux,
+# así que esos dos fallaban al cargar y solo ensuciaban la lista.
+BRIDGE_VERSION = "0.2.17"

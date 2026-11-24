@@ -123,22 +123,6 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         mode="image", pipeline="flux", dtype="bfloat16",
         steps=28, guidance_scale=3.5, max_side=1024, vram_gb=24, family="flux",
     ),
-    "Qwen-Image": ModelSpec(
-        key="Qwen-Image",
-        label="Qwen-Image (imagen con texto legible)",
-        engine="diffusers", repo="Qwen/Qwen-Image",
-        mode="image", pipeline="qwen", dtype="bfloat16",
-        steps=25, guidance_scale=4.0, max_side=1024, vram_gb=24, family="qwen",
-        notes="requiere pipeline custom QwenImagePipeline",
-    ),
-    "HiDream-I1": ModelSpec(
-        key="HiDream-I1",
-        label="HiDream I1-Full (imagen HQ)",
-        engine="diffusers", repo="HiDream-ai/HiDream-I1-Full",
-        mode="image", pipeline="hidream", dtype="bfloat16",
-        steps=28, guidance_scale=5.0, max_side=1024, vram_gb=24, family="hidream",
-        notes="requiere transformers>=4.57 (qwen3_vl)",
-    ),
 
     # ==================================================================
     # VIDEO — factoría genérica diffusers (pesos públicos de HF)
