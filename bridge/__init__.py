@@ -51,4 +51,5 @@ Piezas:
 # 0.2.20: el worker ya no asume CUDA: `device.py` elige CUDA/XPU/CPU con su
 # VRAM y su precisión (fp16 en Arc, fp32 en CPU), y el instalador baja el torch
 # XPU cuando detecta una Intel Arc.
-BRIDGE_VERSION = "0.2.20"
+# 0.2.21: `stop()` encuentra al worker por el puerto cuando no hay worker.pid.
+BRIDGE_VERSION = "0.2.21"
