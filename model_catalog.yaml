@@ -19,7 +19,12 @@ models:
     key: "SD-Tiny-Test"
     label: "SD Tiny (smoke-test del pipeline real)"
     engine: diffusers
-    repo: "diffusers/tiny-stable-diffusion-torch"
+    # diffusers/tiny-stable-diffusion-torch quedó roto con diffusers moderno:
+    # su model_index declara `safety_checker` pero el repo no tiene esa carpeta,
+    # así que el loader la busca en la raíz del snapshot y muere con "no file
+    # named pytorch_model.bin ... found in directory <snapshot>". Éste es el
+    # repo de test que mantiene diffusers y carga bien en 0.36.
+    repo: "hf-internal-testing/tiny-stable-diffusion-torch"
     mode: image
     pipeline: sd15
     dtype: float32

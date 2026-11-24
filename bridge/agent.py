@@ -21,6 +21,7 @@ subida al arrancar (nunca se pierde trabajo por internet).
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import socket
 import threading
@@ -45,6 +46,10 @@ HEARTBEAT_INTERVAL = 20.0
 # Puerto del servidor gRPC local (server.py). El bridge siempre habla con
 # loopback: el back nunca necesita alcanzar esta máquina.
 LOCAL_GRPC = "127.0.0.1:50051"
+
+# Raíz del worker (el directorio del repo/payload), para resolver rutas
+# relativas sin depender de desde dónde se arrancó run.py.
+WORKER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _local_model_states() -> dict:
@@ -358,6 +363,7 @@ class Agent:
         if not artifact_path:
             self._fail(job, "FAILED", "COMPLETED sin artefacto")
             return
+        artifact_path = artifact_file_path(artifact_path)
         entry.state = journal.STATE_ARTIFACT_READY
         entry.artifact_path = artifact_path
         journal.record(entry)
@@ -392,6 +398,36 @@ class Agent:
             self.client.report(task_id, status, progress, stream_status, error)
         except BridgeError as exc:
             logger.warning("[bridge] reporte de %s falló: %s", task_id, exc)
+
+
+def artifact_file_path(raw: str) -> str:
+    """Ruta real en disco del artefacto que reporta el server gRPC.
+
+    El contrato del proto manda sólo el NOMBRE (`syn_123.mp4`): el artifact
+    server lo sirve desde `outputs/` y el back lo resuelve por su cuenta. El
+    bridge, en cambio, tiene que ABRIR el archivo para subirlo, y lo hacía con
+    el nombre suelto desde la raíz del worker: `FileNotFoundError` en los 8
+    reintentos y el job quedaba clavado en 90 % (UPLOAD_PENDING) para siempre,
+    que es exactamente lo que se veía al generar video con el worker
+    descargable. Acá se resuelve contra el out_dir real del worker.
+    """
+    if not raw:
+        return raw
+    if os.path.isabs(raw):
+        return raw
+    if os.path.isfile(raw):
+        return raw
+    out_dir = os.environ.get("BM_OUTPUT_DIR", "outputs")
+    name = os.path.basename(raw)
+    candidates = [os.path.join(out_dir, name)]
+    if not os.path.isabs(out_dir):
+        # `outputs` es relativo al cwd del worker; si el proceso arrancó desde
+        # otra carpeta, la raíz del worker sigue siendo la referencia válida.
+        candidates.append(os.path.join(WORKER_ROOT, out_dir, name))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return candidates[0]
 
 
 def _request_from_payload(job: Job) -> inference_pb2.MediaGenerationRequest:

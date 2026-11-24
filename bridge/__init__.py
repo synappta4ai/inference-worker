@@ -32,4 +32,7 @@ Piezas:
 # 0.2.9: el artifact server lista (GET /artifacts) y borra
 # (DELETE /artifacts/<nombre>) lo generado, que es lo que proxya el back en
 # /api/v1/worker/artifacts. Antes sólo se podía pedir un archivo por nombre.
-BRIDGE_VERSION = "0.2.12"
+# 0.2.13: el instalador descargable fija las versiones de las librerías (diffusers
+# 0.36 / transformers 4.57 / huggingface_hub 0.36) e instala torch CUDA con un
+# constraint, así pip ya no puede dejar un torch CPU en una máquina con GPU.
+BRIDGE_VERSION = "0.2.13"

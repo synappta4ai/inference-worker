@@ -52,8 +52,12 @@ EMBED_URL = (
     f"python-{EMBED_VERSION}-embed-amd64.zip"
 )
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
-TORCH_GPU_INDEX = "https://download.pytorch.org/whl/cu124"   # = Dockerfile
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
+# Índices de wheels CUDA, del más nuevo al más viejo. Blackwell (RTX 50xx,
+# sm_120) necesita cu128 o superior: con cu124 torch no ve la GPU. El driver
+# instalado decide hasta dónde se puede llegar (compatibilidad minor de CUDA).
+CUDA_INDEXES = ((580, "cu130"), (570, "cu128"), (560, "cu126"), (550, "cu124"))
 
 # URL raíz del back (el cliente la pega solo la primera vez; la app la
 # muestra en el diálogo de emparejamiento). SIN /api/v1: el bridge agrega
@@ -322,6 +326,46 @@ def has_nvidia() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
+def driver_version() -> Optional[float]:
+    """Versión del driver NVIDIA como número (616.87), o None si no se sabe."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (out.stdout or "").splitlines():
+        parts = line.strip().split(".")
+        if not parts or not parts[0].isdigit():
+            continue
+        try:
+            return float(f"{parts[0]}.{parts[1] if len(parts) > 1 else 0}")
+        except ValueError:
+            continue
+    return None
+
+
+def cuda_indexes() -> list:
+    """Índices CUDA usables con el driver actual (el más nuevo primero)."""
+    driver = driver_version()
+    if driver is None:
+        # Sin dato del driver, se prueban los tres más nuevos: pip falla rápido
+        # con el que el driver no soporte y se pasa al siguiente.
+        return [name for _min, name in CUDA_INDEXES[:3]]
+    return [name for minimo, name in CUDA_INDEXES if driver >= minimo]
+
+
+def torch_version(py: Path, workdir: Path) -> Optional[str]:
+    """Versión de torch instalada en ese intérprete, o None si no importa."""
+    rc, lines = run_capture(
+        [py, "-c", "import torch; print(torch.__version__)"], cwd=workdir)
+    if rc != 0 or not lines:
+        return None
+    return lines[-1].strip()
+
+
 def port_open(port: int = GRPC_PORT, host: str = "127.0.0.1",
               timeout: float = 0.5) -> bool:
     try:
@@ -396,23 +440,107 @@ def ensure_pip(py: Path, workdir: Path) -> None:
 
 
 # ── dependencias ──────────────────────────────────────────────────
-def install_deps(py: Path, workdir: Path) -> None:
-    """torch (índice según GPU) + requirements.txt. Idempotente."""
-    index = TORCH_GPU_INDEX if has_nvidia() else TORCH_CPU_INDEX
-    logger.info("GPU NVIDIA: %s", "sí → torch cu124" if has_nvidia()
-                else "no → torch cpu")
-    rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
-              "torch", "--index-url", index], cwd=workdir, timeout=None)
+def cuda_torch_version(py: Path, workdir: Path, index: str) -> str:
+    """Versión de torch que ofrece ese índice CUDA (ej. 2.14.1+cu130), o ""."""
+    rc, lines = run_capture(
+        [py, "-m", "pip", "index", "versions", "torch",
+         "--index-url", f"https://download.pytorch.org/whl/{index}"],
+        cwd=workdir, timeout=180)
     if rc != 0:
-        raise RuntimeError("falló la instalación de torch")
+        return ""
+    for line in lines:
+        text = line.strip()
+        if text.lower().startswith("torch ("):
+            inside = text[text.find("(") + 1:text.find(")")].strip()
+            return inside if "+cu" in inside else ""
+    return ""
 
+
+def install_torch(py: Path, workdir: Path) -> tuple:
+    """Instala torch desde el índice CUDA que el driver soporte.
+
+    Devuelve (versión, índice). Dos trampas de pip que este código evita:
+      * `--upgrade torch` NO cambia un 2.15.0+cpu por un 2.14.1+cu130: pip ve
+        2.15.0 como "ya satisfecho" y sale en 0 sin instalar nada. Por eso se
+        fija la versión exacta del índice y se usa --force-reinstall.
+      * los índices de torch no traen las dependencias (sympy, networkx…): van
+        por PyPI con --extra-index-url, mientras el pin exacto impide que pip
+        elija el wheel CPU de PyPI.
+    """
+    current = torch_version(py, workdir) or ""
+    indexes = cuda_indexes() or ["cu124"]
+    if "+cu" in current:
+        logger.info("torch %s ya usa CUDA ✓", current)
+        return current, indexes[0]
+
+    errors: list = []
+    for name in indexes:
+        version = cuda_torch_version(py, workdir, name)
+        if not version:
+            errors.append(f"{name}: el índice no ofrece torch para este Python")
+            continue
+        logger.info("instalando torch %s desde %s …", version, name)
+        rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
+                  "--force-reinstall", f"torch=={version}",
+                  "--index-url", f"https://download.pytorch.org/whl/{name}",
+                  "--extra-index-url", "https://pypi.org/simple"],
+                 cwd=workdir, timeout=None)
+        if rc != 0:
+            errors.append(f"{name}: pip falló")
+            continue
+        got = torch_version(py, workdir) or ""
+        if "+cu" in got:
+            logger.info("torch %s (CUDA) instalado ✓", got)
+            return got, name
+        errors.append(f"{name}: quedó {got or 'sin torch'}")
+    raise RuntimeError(
+        "no pude instalar torch con CUDA (" + "; ".join(errors) + "): "
+        "actualizá el driver NVIDIA desde nvidia.com y volvé a ejecutar el "
+        "instalador")
+
+
+def install_deps(py: Path, workdir: Path) -> None:
+    """torch CUDA + requirements.txt. Idempotente.
+
+    El orden importa: torch primero y, en el paso de requirements, un archivo
+    de constraints con la versión CUDA ya instalada. Sin eso una dependencia
+    (open_clip_torch → torchvision) hacía que pip reemplazara el torch CUDA por
+    el wheel CPU de PyPI, y la GPU quedaba sin usar en silencio.
+    """
     req = worker_dir(workdir) / "requirements.txt"
     if not req.exists():
         raise RuntimeError(f"no encuentro {req} (payload incompleto)")
+
+    extra: list = []
+    gpu = has_nvidia()
+    logger.info("GPU NVIDIA: %s", "sí" if gpu else "no → torch cpu")
+    if gpu:
+        version, index = install_torch(py, workdir)
+        constraints = workdir / "torch-constraints.txt"
+        constraints.write_text(f"torch=={version}\n", encoding="utf-8")
+        extra = ["-c", str(constraints),
+                 "--extra-index-url", f"https://download.pytorch.org/whl/{index}"]
+    else:
+        rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
+                  "--upgrade", "torch", "--index-url", TORCH_CPU_INDEX],
+                 cwd=workdir, timeout=None)
+        if rc != 0:
+            raise RuntimeError("falló la instalación de torch")
+
     rc = run([py, "-m", "pip", "install", "--no-warn-script-location",
-              "-r", req], cwd=workdir, timeout=None)
+              "-r", req, *extra], cwd=workdir, timeout=None)
     if rc != 0:
         raise RuntimeError("falló pip install -r requirements.txt")
+
+    if gpu:
+        # Verificación final, no confianza: si requirements cambió torch por
+        # un wheel CPU el worker arranca sin GPU y todo se vuelve lentísimo.
+        final = torch_version(py, workdir) or ""
+        if "+cu" not in final:
+            raise RuntimeError(
+                f"quedó torch {final or 'sin instalar'} (sin CUDA) después de "
+                "instalar las dependencias: reinstalá el worker")
+        logger.info("verificación final: torch %s usa GPU ✓", final)
 
 
 def run_doctor(py: Path, workdir: Path) -> None:

@@ -64,6 +64,42 @@ def check_gpu() -> None:
             check("GPU NVIDIA", BAD, "nvidia-smi no devolvió GPUs")
     except (OSError, subprocess.TimeoutExpired) as exc:
         check("GPU NVIDIA", BAD, f"no pude consultar el driver: {exc}")
+        return
+    check_torch_cuda()
+
+
+def check_torch_cuda() -> None:
+    """torch y la GPU del sistema tienen que coincidir.
+
+    Un torch CPU sobre una máquina con NVIDIA no falla: el worker arranca, el
+    panel lo muestra online y las generaciones se arrastran (video 1.3B en CPU)
+    o mueren en silencio. Pasó de verdad: el instalador terminó con
+    torch 2.15.0+cpu porque pip resolvió `open_clip_torch` desde PyPI.
+    """
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 — torch roto también es diagnóstico
+        check("torch CUDA", BAD, f"no puedo importar torch: {exc}")
+        return
+    version = getattr(torch, "__version__", "?")
+    if torch.version.cuda is None:
+        check("torch CUDA", BAD,
+              f"torch {version} es el build CPU y esta máquina tiene GPU: "
+              "reinstalá el worker (el instalador baja el build CUDA)")
+        return
+    try:
+        ok = torch.cuda.is_available()
+    except Exception as exc:  # noqa: BLE001
+        check("torch CUDA", BAD, f"torch {version} con CUDA falló: {exc}")
+        return
+    if not ok:
+        check("torch CUDA", BAD,
+              f"torch {version} (CUDA {torch.version.cuda}) no ve la GPU: "
+              "actualizá el driver NVIDIA")
+        return
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    check("torch CUDA", OK, f"{version} · {name} ({vram:.0f} GB)")
 
 
 def check_ram() -> None:

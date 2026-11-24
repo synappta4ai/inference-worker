@@ -1,33 +1,46 @@
-# Dependencias del Inference Worker de Synapta (imagen GPU)
+# Dependencias del Inference Worker de Synapta (imagen/video GPU)
+#
+# VERSIONES FIJAS (==), no mínimos. El worker se prueba contra este set; con
+# `>=` el instalador bajó diffusers 0.43 + transformers 5.x desde PyPI y la
+# generación de imagen murió al cargar el pipeline ("no file named
+# model.safetensors ... found in directory <snapshot>") aunque en el entorno de
+# desarrollo (diffusers 0.36.0 / transformers 4.57.6) andaba perfecto.
+# Para actualizar: probar el worker completo (imagen + video) y subir el pin acá.
+#
+# torch NO va acá: se instala aparte desde el índice CUDA (installer/core.py,
+# Dockerfile) porque en PyPI los wheels de Windows son CPU-only.
+
 # gRPC
 grpcio==1.84.0
 grpcio-tools==1.84.0
 protobuf>=5.29.3
 
-# IA core (torch se instala aparte con index CUDA 12.4 en el Dockerfile)
-diffusers>=0.36.0
-transformers>=4.57.0
-tokenizers>=0.22.0
-accelerate>=1.12.0
+# IA core
+diffusers==0.36.0
+transformers==4.57.6
+# 0.x obligatorio: huggingface_hub 2.x cambia el layout de la caché y mueve
+# utilidades privadas que model_ops usa para cancelar descargas Xet.
+huggingface-hub==0.36.2
+tokenizers==0.22.2
+accelerate==1.16.0
 # 4-bit del text encoder de Wan en GPU: wheels oficiales de Windows y Linux.
-bitsandbytes>=0.45.0 ; (platform_system == "Linux" and platform_machine == "x86_64") or platform_system == "Windows"
-safetensors
+bitsandbytes==0.50.2 ; (platform_system == "Linux" and platform_machine == "x86_64") or platform_system == "Windows"
+safetensors==0.8.0
 sentencepiece
 einops
-open_clip_torch
 
 # Media (encoder MP4 del motor de video)
 # Video: escritura MP4 (imageio) y limpieza de prompt que diffusers importa
 # dentro de sus pipelines de video (Wan/CogVideoX: `ftfy`).
-ftfy>=6.1
-imageio>=2.37.0
-imageio-ffmpeg>=0.6.0
-Pillow
+ftfy==6.3.1
+imageio==2.38.2
+imageio-ffmpeg==0.8.1
+Pillow==13.0.0
 
 # Catálogo de modelos en YAML (model_catalog.yaml). Sin PyYAML el worker
 # arranca igual, con el catálogo embebido de engines/base.py.
-PyYAML>=6.0.2
+PyYAML==6.0.3
 
 # Operación
-psutil
-numpy
+psutil==7.2.2
+numpy==2.5.5

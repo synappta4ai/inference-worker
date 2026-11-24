@@ -316,6 +316,27 @@ def test_request_from_payload_protojson():
     assert req.job_id == "syn_1"  # el job_id del back manda
 
 
+def test_artifact_file_path_resolves_worker_output_dir(tmp_path, monkeypatch):
+    """El artefacto llega como nombre pelado y el upload abre outputs/<nombre>.
+
+    Sin esta resolución el bridge buscaba `syn_1.mp4` en la raíz del worker,
+    fallaba los 8 reintentos de subida y el job quedaba en 90 % para siempre.
+    """
+    from bridge import agent
+
+    out = tmp_path / "outputs"
+    out.mkdir(exist_ok=True)
+    target = out / "syn_1.mp4"
+    target.write_bytes(b"video")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BM_OUTPUT_DIR", raising=False)
+
+    assert agent.artifact_file_path("syn_1.mp4") == os.path.join("outputs", "syn_1.mp4")
+    assert agent.artifact_file_path(str(target)) == str(target)
+    # Nombre desconocido: se devuelve igual para que el error sea del upload.
+    assert agent.artifact_file_path("nope.mp4") == os.path.join("outputs", "nope.mp4")
+
+
 def test_gpu_snapshot_shape():
     """Sin torch/CUDA el snapshot igual tiene la forma que espera el back."""
     os.environ["BM_FORCE_MOCK"] = "1"

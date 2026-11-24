@@ -81,7 +81,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
     "SD-Tiny-Test": ModelSpec(
         key="SD-Tiny-Test",
         label="SD Tiny (smoke-test del pipeline real)",
-        engine="diffusers", repo="diffusers/tiny-stable-diffusion-torch",
+        engine="diffusers", repo="hf-internal-testing/tiny-stable-diffusion-torch",
         mode="image", pipeline="sd15", dtype="float32",
         steps=4, guidance_scale=7.5, max_side=64, vram_gb=2, family="sd",
     ),
