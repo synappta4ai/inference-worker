@@ -227,6 +227,7 @@ class Agent:
         # en el próximo heartbeat para sacarlas de la cola del back.
         pending_acks: list[str] = []
         pending_delete_acks: list[str] = []
+        pending_cancel_acks: list[str] = []
         while not self._stop.is_set():
             snap = gpu_snapshot()
             try:
@@ -239,13 +240,22 @@ class Agent:
                     models=snap["models"],
                     completed_downloads=pending_acks,
                     completed_deletions=pending_delete_acks,
+                    completed_download_cancels=pending_cancel_acks,
                 )
                 pending_acks = []
                 pending_delete_acks = []
+                pending_cancel_acks = []
                 cancels = res.get("cancel_task_ids", [])
                 if isinstance(cancels, list):
                     for task_id in cancels:
                         self._cancel_local(task_id)
+                # Cancelaciones antes que descargas: si el usuario se arrepintió
+                # del mismo modelo, no tiene que arrancar en este latido.
+                download_cancels = res.get("requested_download_cancels", [])
+                if isinstance(download_cancels, list):
+                    for key in download_cancels:
+                        if self._cancel_remote_download(str(key)):
+                            pending_cancel_acks.append(str(key))
                 requested = res.get("requested_models", [])
                 if isinstance(requested, list):
                     for key in requested:
@@ -294,6 +304,42 @@ class Agent:
                                key, name, exc.details() if hasattr(exc, "details") else exc)
                 return True
             logger.warning("[bridge] descarga %s no lanzada, reintento luego: %s", key, exc)
+            return False
+
+    def _cancel_remote_download(self, key: str) -> bool:
+        """Aborta la descarga de esa clave en el gRPC local (pedido del panel).
+
+        Devuelve True si el back puede darlo por tomado: la transferencia se
+        abortó, no había descarga en curso o este worker no conoce la clave.
+        False sólo si el gRPC local no responde — ahí el back reintenta en el
+        próximo latido en vez de perder el pedido.
+        """
+        key = (key or "").strip()
+        if not key:
+            return False
+        try:
+            with grpc.insecure_channel(self.local_grpc) as channel:
+                stub = inference_pb2_grpc.InferenceServiceStub(channel)
+                stub.DownloadModel(
+                    inference_pb2.DownloadModelRequest(key=key, cancel=True),
+                    timeout=30,
+                )
+            logger.info("[bridge] descarga cancelada por pedido del panel: %s", key)
+            return True
+        except grpc.RpcError as exc:
+            code = exc.code() if hasattr(exc, "code") else None
+            name = str(getattr(code, "name", code))
+            if name in ("NOT_FOUND", "INVALID_ARGUMENT", "FAILED_PRECONDITION"):
+                # No hay nada que abortar en este worker: reintentar no cambia nada.
+                logger.warning(
+                    "[bridge] cancelación de %s sin efecto (%s): %s",
+                    key, name, exc.details() if hasattr(exc, "details") else exc,
+                )
+                return True
+            logger.warning(
+                "[bridge] cancelación de %s no aplicada, reintento luego: %s",
+                key, exc,
+            )
             return False
 
     def _start_remote_delete(self, key: str) -> bool:

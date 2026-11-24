@@ -30,6 +30,7 @@ class FakeBack(BaseHTTPRequestHandler):
     cancel_ids: list = []
     requested_models: list = []
     requested_deletions: list = []
+    requested_download_cancels: list = []
     claimed_job: dict | None = None
     # True = el claim devuelve el job pelado en `data` (forma de backs viejos).
     bare_job = False
@@ -67,7 +68,8 @@ class FakeBack(BaseHTTPRequestHandler):
             return self._json(200, {"success": True, "data": {
                 "cancel_task_ids": self.cancel_ids,
                 "requested_models": self.requested_models,
-                "requested_deletions": self.requested_deletions}})
+                "requested_deletions": self.requested_deletions,
+                "requested_download_cancels": self.requested_download_cancels}})
         if self.path.startswith("/api/v1/internal/workers/claim"):
             job = self.claimed_job
             self.claimed_job = None  # solo una entrega
@@ -104,6 +106,7 @@ def fake_back():
     FakeBack.bare_job = False
     FakeBack.requested_models = []
     FakeBack.requested_deletions = []
+    FakeBack.requested_download_cancels = []
     FakeBack.revoked = False
     server = HTTPServer(("127.0.0.1", 0), FakeBack)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -259,6 +262,24 @@ def test_client_heartbeat_deletion_queue(fake_back):
     assert FakeBack.heartbeats[-1]["completed_deletions"] == ["SDXL-Turbo"]
 
 
+def test_client_heartbeat_download_cancel_queue(fake_back):
+    """El panel cancela una descarga: viaja como requested_download_cancels y
+    el agente lo confirma con completed_download_cancels en el latido siguiente."""
+    FakeBack.requested_download_cancels = ["FLUX.1-dev"]
+    client = BridgeClient(fake_back, token="tok-secret")
+    res = client.heartbeat(gpu_name="RTX", version="0.2.23",
+                           vram_free_mb=100, jobs_active=0, models=[])
+    assert res["requested_download_cancels"] == ["FLUX.1-dev"]
+    assert FakeBack.heartbeats[-1].get("completed_download_cancels", []) == []
+
+    FakeBack.requested_download_cancels = []
+    res2 = client.heartbeat(gpu_name="RTX", version="0.2.23",
+                            vram_free_mb=100, jobs_active=0, models=[],
+                            completed_download_cancels=["FLUX.1-dev"])
+    assert res2["requested_download_cancels"] == []
+    assert FakeBack.heartbeats[-1]["completed_download_cancels"] == ["FLUX.1-dev"]
+
+
 # ─── Borrado de pesos en el agente ─────────────────────────────
 
 def _agent(jobs_active: int = 0):
@@ -353,6 +374,74 @@ def test_agent_delete_acks_unknown_key(monkeypatch):
     ag = _agent()
 
     assert ag._start_remote_delete("Fantasma") is True
+
+
+def _stub_download(monkeypatch, *, raises=None, registro=None):
+    """Reemplaza el canal gRPC local y captura (key, cancel) de DownloadModel."""
+    import contextlib
+
+    from bridge import agent as agent_mod
+
+    class Stub:
+        def __init__(self, _channel):
+            pass
+
+        def DownloadModel(self, req, timeout=None):  # noqa: N802 — nombre del proto
+            if registro is not None:
+                registro.append((req.key, bool(req.cancel)))
+            if raises is not None:
+                raise raises
+            return object()
+
+    monkeypatch.setattr(agent_mod.grpc, "insecure_channel",
+                        lambda target: contextlib.nullcontext(object()))
+    monkeypatch.setattr(agent_mod.inference_pb2_grpc, "InferenceServiceStub", Stub)
+    return agent_mod
+
+
+def test_agent_cancel_download_calls_local_grpc(monkeypatch):
+    """Cancelar descarga pide DownloadModel(cancel=True): el gRPC local aborta
+    la transferencia y descarta los bytes parciales."""
+    llamadas: list[tuple[str, bool]] = []
+    _stub_download(monkeypatch, registro=llamadas)
+    ag = _agent()
+
+    assert ag._cancel_remote_download("SDXL-Turbo") is True
+    assert llamadas == [("SDXL-Turbo", True)]
+
+
+def test_agent_cancel_download_acks_unknown_key(monkeypatch):
+    """Una clave que este worker no conoce no se reintenta para siempre."""
+    agent_mod = _stub_download(monkeypatch)
+
+    class NoExiste(agent_mod.grpc.RpcError):
+        def code(self):
+            return agent_mod.grpc.StatusCode.NOT_FOUND
+
+        def details(self):
+            return "modelo desconocido"
+
+    _stub_download(monkeypatch, raises=NoExiste())
+    ag = _agent()
+
+    assert ag._cancel_remote_download("Fantasma") is True
+
+
+def test_agent_cancel_download_retries_when_grpc_is_down(monkeypatch):
+    """Si el gRPC local no responde no se hace ack: el back reintenta."""
+    agent_mod = _stub_download(monkeypatch)
+
+    class Caido(agent_mod.grpc.RpcError):
+        def code(self):
+            return agent_mod.grpc.StatusCode.UNAVAILABLE
+
+        def details(self):
+            return "connection refused"
+
+    _stub_download(monkeypatch, raises=Caido())
+    ag = _agent()
+
+    assert ag._cancel_remote_download("SDXL-Turbo") is False
 
 
 def test_client_heartbeat_rejects_bad_token(fake_back):
