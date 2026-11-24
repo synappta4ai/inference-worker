@@ -52,4 +52,7 @@ Piezas:
 # VRAM y su precisión (fp16 en Arc, fp32 en CPU), y el instalador baja el torch
 # XPU cuando detecta una Intel Arc.
 # 0.2.21: `stop()` encuentra al worker por el puerto cuando no hay worker.pid.
-BRIDGE_VERSION = "0.2.21"
+# 0.2.22: el agente atiende `requested_deletions` del heartbeat (borrar pesos
+# para liberar disco de una máquina emparejada) y confirma con
+# `completed_deletions`. Un back sin la cola simplemente manda la lista vacía.
+BRIDGE_VERSION = "0.2.22"
