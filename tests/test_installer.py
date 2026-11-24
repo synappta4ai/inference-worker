@@ -805,7 +805,9 @@ def test_update_reemplaza_codigo_sin_tocar_python_ni_pesos(tmp_path, monkeypatch
     monkeypatch.setattr(core, "download_payload", fake_download)
     monkeypatch.setattr(core, "extract_payload", fake_extract)
     monkeypatch.setattr(core, "stop", lambda *a, **k: events.append(("stop", None)))
-    monkeypatch.setattr(core, "start", lambda *a, **k: events.append(("start", None)))
+    monkeypatch.setattr(core, "_wait_port_closed", lambda *a, **k: True)
+    monkeypatch.setattr(core, "start",
+                        lambda *a, **k: events.append(("start", k.get("require_clean"))))
     monkeypatch.setattr(core, "install_deps",
                         lambda *a, **k: events.append(("deps", None)))
 
@@ -818,7 +820,8 @@ def test_update_reemplaza_codigo_sin_tocar_python_ni_pesos(tmp_path, monkeypatch
     assert not (tmp_path / "update-payload.zip").exists()
     # orden: bajar → detener → reemplazar → arrancar
     assert [e[0] for e in events][:3] == ["download", "stop", "extract"]
-    assert events[-1][0] == "start"
+    # require_clean: arrancar de verdad, no dar por bueno un puerto ocupado
+    assert events[-1] == ("start", True)
     # sin requirements.txt previo se reinstalan y queda la marca
     assert ("deps", None) in events
     assert (tmp_path / core.REQ_MARKER).exists()
@@ -847,6 +850,7 @@ def test_update_saltea_las_dependencias_si_no_cambiaron(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "extract_payload",
                         lambda zip_path, target, retries=6: zipfile.ZipFile(zip_path).extractall(target))
     monkeypatch.setattr(core, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(core, "_wait_port_closed", lambda *a, **k: True)
     monkeypatch.setattr(core, "start", lambda *a, **k: None)
     monkeypatch.setattr(core, "install_deps",
                         lambda *a, **k: events.append("deps"))
@@ -991,7 +995,7 @@ def test_updater_sobrevive_a_consola_cp1252(tmp_path, monkeypatch):
 
     monkeypatch.setattr(uw, "download_payload",
                         lambda url, dest, timeout=60.0: Path(dest).write_bytes(b"PK\x05\x06"))
-    monkeypatch.setattr(uw, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(uw, "stop_for_update", lambda *a, **k: None)
     monkeypatch.setattr(uw, "extract_payload", lambda *a, **k: None)
     monkeypatch.setattr(uw, "ensure_python", lambda *a, **k: tmp_path / "python.exe")
     monkeypatch.setattr(uw, "ensure_pip", lambda *a, **k: None)
@@ -1009,6 +1013,124 @@ def test_updater_sobrevive_a_consola_cp1252(tmp_path, monkeypatch):
     assert state["status"] == "ok"
     # el zip temporal no queda tirado
     assert not (tmp_path / "_update-download.zip").exists()
+
+
+# ── update con el worker arrancado fuera del instalador ──────────
+# Sin `worker.pid` (autostart, script suelto) el update reemplazaba los
+# archivos y avisaba "actualizado a vX" mientras el proceso viejo seguía
+# respondiendo en :50051 con el código anterior.
+
+def _worker_instalado(tmp_path):
+    (tmp_path / "worker").mkdir()
+    (tmp_path / "worker" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+    core.python_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    core.python_path(tmp_path).write_bytes(b"")
+    return tmp_path
+
+
+def _payload(version: str):
+    """fake de download_payload: escribe un zip con esa versión."""
+    def _download(url, dest, timeout=60.0):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("run.py", "print('nuevo')\n")
+            zf.writestr("bridge/__init__.py", _init_with_version(version))
+        Path(dest).write_bytes(buffer.getvalue())
+        return Path(dest)
+    return _download
+
+
+def test_stop_for_update_reintenta_contra_el_dueno_del_puerto(tmp_path, monkeypatch):
+    """El pid no estaba (o estaba viejo) y el puerto seguía tomado."""
+    llamadas = []
+    monkeypatch.setattr(core, "stop", lambda *a, **k: llamadas.append(("stop", None)))
+    esperas = iter([False, True])
+    monkeypatch.setattr(core, "_wait_port_closed", lambda *a, **k: next(esperas))
+    monkeypatch.setattr(core, "port_pid", lambda *a, **k: 7777)
+    monkeypatch.setattr(core, "process_name", lambda pid: "python.exe")
+    monkeypatch.setattr(core, "_kill_pid",
+                        lambda pid, tree=True: llamadas.append(("kill", pid, tree)))
+
+    core.stop_for_update(tmp_path)
+
+    assert llamadas == [("stop", None), ("kill", 7777, True)]
+
+
+def test_stop_for_update_no_mata_un_proceso_ajeno(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(core, "_wait_port_closed", lambda *a, **k: False)
+    monkeypatch.setattr(core, "port_pid", lambda *a, **k: 5555)
+    monkeypatch.setattr(core, "process_name", lambda pid: "chrome.exe")
+    monkeypatch.setattr(core, "_kill_pid",
+                        lambda *a, **k: pytest.fail("mató un proceso ajeno"))
+
+    with pytest.raises(RuntimeError, match="5555"):
+        core.stop_for_update(tmp_path)
+
+
+def test_update_no_da_por_buena_la_actualizacion_si_el_puerto_sigue_ocupado(
+        tmp_path, monkeypatch):
+    """El bug reportado: sin worker.pid, el proceso viejo queda vivo."""
+    _worker_instalado(tmp_path)
+    extraido = []
+    monkeypatch.setattr(core, "download_payload", _payload("0.2.18"))
+    monkeypatch.setattr(core, "extract_payload", lambda *a, **k: extraido.append(a))
+    monkeypatch.setattr(core, "stop", lambda *a, **k: None)
+    monkeypatch.setattr(core, "_wait_port_closed", lambda *a, **k: False)
+    monkeypatch.setattr(core, "port_pid", lambda *a, **k: 4242)
+    monkeypatch.setattr(core, "process_name", lambda pid: "python.exe")
+    monkeypatch.setattr(core, "_kill_pid", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="No se tocaron los archivos"):
+        core.update(tmp_path)
+
+    # aborta ANTES de reemplazar: el worker viejo sigue entero y sin zip tirado
+    assert extraido == []
+    assert (tmp_path / "worker" / "run.py").read_text(encoding="utf-8") == \
+        "print('hi')\n"
+    assert not (tmp_path / "update-payload.zip").exists()
+
+
+def test_start_require_clean_falla_si_el_puerto_sigue_ocupado(tmp_path, monkeypatch):
+    _worker_instalado(tmp_path)
+    monkeypatch.setattr(core, "port_open", lambda *a, **k: True)
+    monkeypatch.setattr(core, "port_pid", lambda *a, **k: 4321)
+    monkeypatch.setattr(core, "process_name", lambda pid: "python.exe")
+
+    with pytest.raises(RuntimeError, match="sigue ocupado"):
+        core.start(tmp_path, require_clean=True)
+
+
+def test_start_sigue_siendo_idempotente_en_la_instalacion(tmp_path, monkeypatch):
+    """La instalación no cambia: con el worker ya arriba, no hace nada."""
+    _worker_instalado(tmp_path)
+    monkeypatch.setattr(core, "port_open", lambda *a, **k: True)
+
+    assert core.start(tmp_path) is None
+
+
+def test_start_require_clean_exige_que_escuche_el_proceso_nuevo(tmp_path, monkeypatch):
+    """El puerto aparece pero lo tiene otro pid: es el worker viejo."""
+    _worker_instalado(tmp_path)
+    estado = {"arrancado": False}
+
+    class Proc:
+        pid = 111
+
+        def poll(self):
+            return None
+
+    def fake_popen(*a, **k):
+        estado["arrancado"] = True
+        return Proc()
+
+    monkeypatch.setattr(core, "port_open", lambda *a, **k: estado["arrancado"])
+    monkeypatch.setattr(core.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(core, "listener_is", lambda *a, **k: False)
+    monkeypatch.setattr(core, "port_pid", lambda *a, **k: 999)
+
+    with pytest.raises(RuntimeError, match="no el worker nuevo"):
+        core.start(tmp_path, require_clean=True)
 
 
 def test_gui_modelos_lista_y_habilita_acciones(tmp_path, monkeypatch):

@@ -980,10 +980,25 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def start(workdir: Optional[Path] = None, wait: float = 20.0) -> None:
-    """Arranca run.py desacoplado (sobrevive al cierre de la GUI)."""
+def start(workdir: Optional[Path] = None, wait: float = 20.0,
+          require_clean: bool = False) -> None:
+    """Arranca run.py desacoplado (sobrevive al cierre de la GUI).
+
+    `require_clean=True` (lo que usa la actualización) no acepta un puerto ya
+    ocupado: si alguien sigue escuchando en :GRPC_PORT es el proceso viejo, y
+    dar eso por bueno deja al usuario con archivos nuevos y código anterior en
+    memoria. En ese modo también falla si el que escucha no es el proceso
+    recién lanzado o si no levanta en `wait` segundos.
+    """
     workdir = (workdir or default_dir()).expanduser().resolve()
     if port_open():
+        if require_clean:
+            pid = port_pid() or 0
+            dueno = f" (pid {pid}, {process_name(pid) or 'proceso'})" if pid else ""
+            raise RuntimeError(
+                f"el puerto :{GRPC_PORT} sigue ocupado{dueno}: el worker que "
+                "responde es el proceso viejo, no el que se acaba de instalar. "
+                "Cerralo y volvé a buscar la actualización.")
         logger.info("worker ya escuchando en :%d", GRPC_PORT)
         return
     py = python_path(workdir)
@@ -1010,12 +1025,23 @@ def start(workdir: Optional[Path] = None, wait: float = 20.0) -> None:
     deadline = time.time() + wait
     while time.time() < deadline:
         if port_open():
+            if require_clean and not listener_is(proc.pid):
+                dueno = port_pid() or 0
+                raise RuntimeError(
+                    f"el puerto :{GRPC_PORT} lo tomó otro proceso (pid {dueno}), "
+                    f"no el worker nuevo (pid {proc.pid}): el código "
+                    "actualizado no está corriendo.")
             logger.info("gRPC local activo en :%d ✓", GRPC_PORT)
             return
         if proc.poll() is not None:
             tail = _tail(workdir / "worker.log")
             raise RuntimeError(f"el worker murió al arrancar:\n{tail}")
         time.sleep(0.5)
+    if require_clean:
+        tail = _tail(workdir / "worker.log")
+        raise RuntimeError(
+            f"el worker nuevo (pid {proc.pid}) no abrió el puerto :{GRPC_PORT} "
+            f"en {wait:.0f} s:\n{tail}")
     logger.warning("el puerto :%d no respondió en %.0f s (mirá worker.log)",
                    GRPC_PORT, wait)
 
@@ -1062,6 +1088,90 @@ def process_name(pid: int) -> str:
     return ""
 
 
+def _kill_pid(pid: int, tree: bool = True) -> None:
+    """Mata `pid` (y su árbol de procesos si `tree`)."""
+    if os.name == "nt":
+        cmd = ["taskkill", "/PID", str(pid), "/F"]
+        if tree:
+            cmd.insert(3, "/T")
+        subprocess.run(cmd, capture_output=True)
+    else:
+        os.kill(pid, 15)
+
+
+def _wait_port_closed(timeout: float = 10.0, port: int = GRPC_PORT) -> bool:
+    """Espera a que nadie escuche en `port`; True si quedó libre.
+
+    El socket no se suelta en el instante en que muere el proceso (hijos,
+    DLLs, conexiones en TIME_WAIT): preguntar una sola vez miente en los dos
+    sentidos.
+    """
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        if not port_open(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def listener_is(pid: int, port: int = GRPC_PORT) -> bool:
+    """¿El que escucha en `port` es `pid`? Sin dato, no se acusa a nadie.
+
+    netstat/tasklist son de Windows; en el resto de los sistemas no hay forma
+    barata de saberlo, así que se confía en que el puerto estaba libre antes
+    de arrancar.
+    """
+    if os.name != "nt":
+        return True
+    actual = port_pid(port)
+    return actual is None or actual == pid
+
+
+# Quién ocupa el puerto cuando `stop()` ya hizo lo suyo, para el mensaje.
+def _port_owner() -> str:
+    pid = port_pid() or 0
+    if not pid:
+        return "otro proceso"
+    return f"pid {pid} ({process_name(pid) or 'proceso desconocido'})"
+
+
+def stop_for_update(workdir: Optional[Path] = None, timeout: float = 10.0,
+                    tree: bool = True) -> None:
+    """Detiene el worker y garantiza que :GRPC_PORT quede libre, o aborta.
+
+    `stop()` alcanza cuando el worker escribió `worker.pid`, pero si lo arrancó
+    el autostart o a mano ese archivo puede faltar, estar viejo o apuntar a un
+    proceso muerto. Antes se reemplazaban los archivos igual: el proceso vivo
+    seguía sirviendo el código anterior, `start()` veía el puerto ocupado y se
+    volvía sin arrancar nada, y la GUI avisaba "actualizado" con el worker
+    viejo respondiendo.
+
+    Acá se verifica el puerto de verdad y, si sigue tomado, se reintenta una
+    vez contra el dueño real. Si no se libera, se lanza RuntimeError **antes**
+    de tocar los archivos: mejor un worker viejo y sano que uno con archivos
+    nuevos y código viejo en memoria.
+
+    `tree=False` para el updater, que corre como hijo del worker.
+    """
+    workdir = (workdir or default_dir()).expanduser().resolve()
+    stop(workdir, tree=tree)
+    if _wait_port_closed(timeout):
+        return
+    pid = port_pid() or 0
+    if pid and "python" in process_name(pid).lower():
+        logger.info(
+            "el puerto :%d sigue ocupado por python (pid %d): lo detengo",
+            GRPC_PORT, pid,
+        )
+        _kill_pid(pid, tree=tree)
+        if _wait_port_closed(timeout):
+            return
+    raise RuntimeError(
+        f"el puerto :{GRPC_PORT} lo sigue usando {_port_owner()}: cerralo y "
+        "volvé a buscar la actualización. No se tocaron los archivos del worker.")
+
+
 def stop(workdir: Optional[Path] = None, tree: bool = True) -> None:
     """Detiene el worker registrado en `worker.pid`.
 
@@ -1094,13 +1204,7 @@ def stop(workdir: Optional[Path] = None, tree: bool = True) -> None:
         )
         pid = encontrado
     if pid and _alive(pid):
-        if os.name == "nt":
-            cmd = ["taskkill", "/PID", str(pid), "/F"]
-            if tree:
-                cmd.insert(3, "/T")
-            subprocess.run(cmd, capture_output=True)
-        else:
-            os.kill(pid, 15)
+        _kill_pid(pid, tree=tree)
         logger.info("worker (pid %d) detenido", pid)
     else:
         logger.info("worker no estaba corriendo")
@@ -1405,8 +1509,13 @@ def update(workdir: Optional[Path] = None, url: Optional[str] = None) -> dict:
     new_version = version_from_payload(tmp.read_bytes())
     logger.info("payload nuevo: v%s", new_version or "(sin versión)")
 
-    # Windows bloquea las DLL del proceso vivo: primero se detiene.
-    stop(workdir)
+    # Windows bloquea las DLL del proceso vivo: primero se detiene. Si el
+    # puerto no queda libre, esto aborta antes de reemplazar nada.
+    try:
+        stop_for_update(workdir)
+    except RuntimeError:
+        tmp.unlink(missing_ok=True)  # no dejar el zip tirado si no se aplicó
+        raise
     logger.info("reemplazando el código del worker…")
     extract_payload(tmp, worker_dir(workdir))
     tmp.unlink(missing_ok=True)
@@ -1421,9 +1530,12 @@ def update(workdir: Optional[Path] = None, url: Optional[str] = None) -> dict:
     elif py.exists():
         logger.info("dependencias sin cambios: no se reinstalan")
 
-    start(workdir)
+    # require_clean: si el puerto lo toma otro proceso (o no levanta), falla en
+    # vez de reportar una actualización que en realidad no está corriendo.
+    start(workdir, require_clean=True)
     logger.info("worker actualizado a v%s y en línea", new_version or "?")
-    return {"version": new_version, "workdir": str(workdir)}
+    return {"version": new_version or local_version(workdir),
+            "workdir": str(workdir)}
 
 
 def apply_update(url: Optional[str] = None, timeout: float = 20.0) -> dict:

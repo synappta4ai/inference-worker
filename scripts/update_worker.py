@@ -28,7 +28,7 @@ from core import (  # noqa: E402
     install_deps,
     run_doctor,
     start,
-    stop,
+    stop_for_update,
     worker_dir,
 )
 
@@ -96,9 +96,11 @@ def main() -> int:
 
     try:
         # Sin árbol: este proceso es hijo del worker y `/T` lo mataría a él.
-        stop(workdir, tree=False)
+        # Si el puerto no queda libre se aborta ANTES de extraer, en vez de
+        # dejar archivos nuevos sobre un proceso que sigue con el código viejo.
+        stop_for_update(workdir, tree=False)
     except Exception as exc:
-        say(f"[!] stop falló (ignorando): {exc}")
+        return fail(f"no pude detener el worker: {exc}")
 
     try:
         extract_payload(tmp, worker_dir(workdir))
@@ -119,7 +121,7 @@ def main() -> int:
         return fail(f"doctor falló: {exc}")
 
     try:
-        start(workdir)
+        start(workdir, require_clean=True)
     except Exception as exc:
         return fail(f"arranque falló: {exc}")
 
