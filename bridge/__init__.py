@@ -62,4 +62,7 @@ Piezas:
 # la descarga en curso (DownloadModel cancel=true) y descarta los bytes
 # parciales, así elegir el modelo equivocado en una GPU emparejada ya no obliga
 # a esperar la descarga entera. Confirma con `completed_download_cancels`.
-BRIDGE_VERSION = "0.2.24"
+# 0.2.25: el heartbeat manda `vram_total_mb`: el panel mostraba «Memoria —» y
+# toda la columna «En tu GPU» en «—» porque el registry quedaba en 0 (sólo se
+# guardaba al emparejar). Un 0 conserva el último valor conocido.
+BRIDGE_VERSION = "0.2.25"
