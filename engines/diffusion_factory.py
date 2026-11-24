@@ -482,6 +482,34 @@ def _run_image(pipe, req, spec: ModelSpec, report: Callable, cancel, steps: int)
     return image
 
 
+# Los pipelines de video exigen lados múltiplos de 32 (LTX) o 16 (Wan):
+# redondear a 32 cumple las dos familias.
+_VIDEO_DIM_STEP = 32
+
+
+def _round_to_step(value: float, step: int = _VIDEO_DIM_STEP) -> int:
+    return max(step, int(round(value / step)) * step)
+
+
+def _video_dims(req, spec: ModelSpec) -> tuple[int, int]:
+    """Dimensiones del video a partir del ratio pedido (width/height del job).
+
+    El lado corto cae en el `max_side` del modelo y el largo se deriva del
+    aspecto pedido, ambos en múltiplos de 32. Sin esto el pipeline usa su
+    default (832x480 en Wan) y un pedido 9:16 salía horizontal. Con max_side
+    480: 9:16 -> 480x832, 16:9 -> 832x480, 1:1 -> 480x480, 4:3 -> 640x480.
+    """
+    short = _round_to_step(float(getattr(spec, "max_side", 0) or 512))
+    target_w = int(getattr(req, "width", 0) or 0)
+    target_h = int(getattr(req, "height", 0) or 0)
+    if target_w <= 0 or target_h <= 0:
+        # Sin ratio explícito: cuadrado del lado que el modelo banca.
+        return short, short
+    if target_w <= target_h:
+        return short, _round_to_step(short * target_h / target_w)
+    return _round_to_step(short * target_w / target_h), short
+
+
 def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
                cancel, steps: int):
     """Genera video real: frames decodificados del VAE + MP4 con imageio."""
@@ -503,8 +531,17 @@ def _run_video(pipe, req, spec: ModelSpec, out_dir: str, report: Callable,
         report(min(step_index + 1, steps) / steps * 88.0, "GENERATING")
         return {}
 
+    width, height = _video_dims(req, spec)
+    logger.info(
+        "[Factory] video %sx%s (pedido %sx%s, max_side %s)",
+        width, height, getattr(req, "width", 0) or "?",
+        getattr(req, "height", 0) or "?", getattr(spec, "max_side", 0) or "?",
+    )
+
     kwargs = dict(
         prompt=req.prompt or "",
+        width=width,
+        height=height,
         num_frames=frames,
         num_inference_steps=steps,
         callback_on_step_end=on_step_end,

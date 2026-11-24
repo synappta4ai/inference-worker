@@ -654,6 +654,76 @@ class TestSeedVideo:
         assert "generator" not in kwargs
 
 
+class TestVideoDims:
+    """El video respeta el ratio pedido.
+
+    Regresión: `_run_video` no pasaba width/height, así que un pedido 9:16
+    salía con el default del pipeline (832x480, horizontal) aunque el back
+    mandara 480x832.
+    """
+
+    @pytest.mark.parametrize(
+        ("ratio_w", "ratio_h", "esperado"),
+        [
+            (480, 832, (480, 832)),   # 9:16
+            (832, 480, (832, 480)),   # 16:9
+            (512, 512, (480, 480)),   # 1:1
+            (640, 480, (640, 480)),   # 4:3
+            (480, 640, (480, 640)),   # 3:4
+        ],
+    )
+    def test_lado_corto_en_el_max_side_y_multiplos_de_32(
+        self, ratio_w, ratio_h, esperado
+    ):
+        req = types.SimpleNamespace(width=ratio_w, height=ratio_h)
+        spec = types.SimpleNamespace(max_side=480)
+
+        dims = diffusion_factory._video_dims(req, spec)
+
+        assert dims == esperado
+        assert all(lado % 32 == 0 for lado in dims)
+
+    def test_sin_ratio_usa_el_cuadrado_del_max_side(self):
+        req = types.SimpleNamespace(width=0, height=0)
+        spec = types.SimpleNamespace(max_side=704)
+
+        assert diffusion_factory._video_dims(req, spec) == (704, 704)
+
+    def test_ltx_9_16_queda_en_multiplos_de_32(self):
+        # 704 es el max_side de LTX: el largo se redondea al múltiplo de 32.
+        req = types.SimpleNamespace(width=480, height=832)
+        spec = types.SimpleNamespace(max_side=704)
+
+        ancho, alto = diffusion_factory._video_dims(req, spec)
+
+        assert (ancho, alto) == (704, 1216)
+        assert ancho % 32 == 0 and alto % 32 == 0
+
+    def test_run_video_le_pasa_las_dims_al_pipeline(self, tmp_path):
+        class _Pipe:
+            def __init__(self):
+                self.kwargs = None
+
+            def __call__(self, **kwargs):
+                self.kwargs = kwargs
+                frame = np.zeros((8, 8, 3), dtype=np.uint8)
+                return types.SimpleNamespace(frames=[np.stack([frame] * 4)])
+
+        pipe = _Pipe()
+        req = types.SimpleNamespace(
+            job_id="ratio", prompt="un gato astronauta", num_frames=4, fps=8,
+            seed=0, negative_prompt="", width=480, height=832,
+        )
+        spec = types.SimpleNamespace(guidance_scale=0.0, max_side=480)
+
+        diffusion_factory._run_video(
+            pipe, req, spec, str(tmp_path), lambda *a, **k: None,
+            cancel=types.SimpleNamespace(is_set=lambda: False), steps=2,
+        )
+
+        assert (pipe.kwargs["width"], pipe.kwargs["height"]) == (480, 832)
+
+
 class TestMockArtifacts:
     """El artefacto mock tiene que corresponder al modo pedido."""
 
