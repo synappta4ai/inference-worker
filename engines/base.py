@@ -77,20 +77,21 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
     # ==================================================================
     # IMAGEN — factoría genérica diffusers (pesos públicos de HF)
     # ==================================================================
-    # SD-Tiny: minúsculo (~100 MB) para smoke-tests sin descargas pesadas.
-    "SD-Tiny-Test": ModelSpec(
-        key="SD-Tiny-Test",
-        label="SD Tiny (smoke-test del pipeline real)",
-        engine="diffusers", repo="hf-internal-testing/tiny-stable-diffusion-torch",
-        mode="image", pipeline="sd15", dtype="float32",
-        steps=4, guidance_scale=7.5, max_side=64, vram_gb=2, family="sd",
-    ),
     "SD-1.5": ModelSpec(
         key="SD-1.5",
         label="Stable Diffusion 1.5 (imagen real, ligera)",
         engine="diffusers", repo="stable-diffusion-v1-5/stable-diffusion-v1-5",
         mode="image", pipeline="sd15",
         steps=20, guidance_scale=7.5, max_side=512, vram_gb=4, family="sd",
+        notes="3060, 4060, 5050 e Intel Arc: 512 px en fp16",
+    ),
+    "SD-Turbo": ModelSpec(
+        key="SD-Turbo",
+        label="SD Turbo (imagen en 1-4 pasos)",
+        engine="diffusers", repo="stabilityai/sd-turbo",
+        mode="image", pipeline="sd15", dtype="float16",
+        steps=4, guidance_scale=0.0, max_side=512, vram_gb=4, family="sd",
+        notes="iGPU/CPU (Ryzen, Intel integrada): 512 px en 4 pasos",
     ),
     "SDXL-Turbo": ModelSpec(
         key="SDXL-Turbo",
@@ -98,6 +99,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         engine="diffusers", repo="stabilityai/sdxl-turbo",
         mode="image", pipeline="sdxl", dtype="float16",
         steps=2, guidance_scale=0.0, max_side=512, vram_gb=8, family="sdxl",
+        notes="8 GB en adelante: 512 px en 2 pasos",
     ),
     "SDXL-Base": ModelSpec(
         key="SDXL-Base",
@@ -112,6 +114,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         engine="diffusers", repo="black-forest-labs/FLUX.1-schnell",
         mode="image", pipeline="flux", dtype="bfloat16",
         steps=4, guidance_scale=0.0, max_side=1024, vram_gb=16, family="flux",
+        notes="12 GB; en 8 GB solo con NF4/offload",
     ),
     "FLUX.1-dev": ModelSpec(
         key="FLUX.1-dev",
@@ -155,6 +158,7 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
         # 10 era el spec fp16 del modelo entero; con el text encoder cuantizado
         # a 4-bit (pico real en VRAM) alcanza de sobra en la T4 de Colab.
         steps=30, guidance_scale=5.0, max_side=480, vram_gb=6, family="wan",
+        notes="8 GB: TE 4-bit + VAE fp32 (pico medido 7,69 GB)",
     ),
     "Wan2.1-T2V-14B": ModelSpec(
         key="Wan2.1-T2V-14B",
@@ -235,27 +239,8 @@ BUILTIN_CATALOG: dict[str, ModelSpec] = {
     ),
 
     # ==================================================================
-    # TTS / MÚSICA — engines dedicados (fase siguiente del worker)
+    # MÚSICA — vía bridge V1 (código propietario, no corre local)
     # ==================================================================
-    "Chatterbox-TTS": ModelSpec(
-        key="Chatterbox-TTS",
-        label="Chatterbox TTS (voz, clonación por referencia)",
-        engine="mock", repo=None,
-        mode="tts", pipeline="tts", vram_gb=6, family="tts",
-        notes="engine dedicado en fase 2 del worker",
-    ),
-    "IndexTTS2": ModelSpec(
-        key="IndexTTS2",
-        label="IndexTTS2 (voz emocional)",
-        engine="mock", repo=None,
-        mode="tts", pipeline="tts", vram_gb=8, family="tts",
-    ),
-    "ACE-Step-Music": ModelSpec(
-        key="ACE-Step-Music",
-        label="ACE-Step (música por prompt/letra)",
-        engine="mock", repo=None,
-        mode="audio", pipeline="music", vram_gb=10, family="music",
-    ),
     "YuE2-Music": ModelSpec(
         key="YuE2-Music",
         label="YuE2 (música completa con voz, vía bridge V1)",

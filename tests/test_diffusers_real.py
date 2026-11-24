@@ -13,7 +13,16 @@ import inference_pb2
 import pytest
 
 from engines import diffusion_factory
-from engines.base import EngineContext, MODEL_CATALOG
+from engines.base import EngineContext, ModelSpec
+
+# El catálogo de producción ya no trae modelos de prueba, así que el test se
+# arma su propia spec con el repo tiny de diffusers (~100 MB).
+TINY = ModelSpec(
+    key="tiny", label="SD Tiny", engine="diffusers",
+    repo="hf-internal-testing/tiny-stable-diffusion-torch",
+    mode="image", pipeline="sd15", dtype="float32",
+    steps=4, guidance_scale=7.5, max_side=64, vram_gb=2, family="sd",
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("BM_TEST_REAL", "").lower() not in ("1", "true", "yes"),
@@ -22,9 +31,9 @@ pytestmark = pytest.mark.skipif(
 
 
 async def test_real_diffusion_pipeline(tmp_path):
-    spec = MODEL_CATALOG["SD-Tiny-Test"]
+    spec = TINY
     req = inference_pb2.MediaGenerationRequest(
-        job_id="real1", mode="image", model_name="SD-Tiny-Test",
+        job_id="real1", mode="image", model_name="tiny",
         prompt="a green tree", steps=2,
     )
     ctx = EngineContext(out_dir=str(tmp_path), cancel=asyncio.Event())
@@ -48,9 +57,9 @@ async def test_real_diffusion_pipeline(tmp_path):
 
 
 async def test_real_pipeline_respects_cancellation(tmp_path):
-    spec = MODEL_CATALOG["SD-Tiny-Test"]
+    spec = TINY
     req = inference_pb2.MediaGenerationRequest(
-        job_id="realc", mode="image", model_name="SD-Tiny-Test",
+        job_id="realc", mode="image", model_name="tiny",
         prompt="a rock", steps=40,
     )
     ctx = EngineContext(out_dir=str(tmp_path), cancel=asyncio.Event())

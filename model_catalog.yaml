@@ -15,25 +15,6 @@ models:
   # ==================================================================
   # IMAGEN — factoría genérica diffusers (pesos públicos de HF)
   # ==================================================================
-  SD-Tiny-Test:
-    key: "SD-Tiny-Test"
-    label: "SD Tiny (smoke-test del pipeline real)"
-    engine: diffusers
-    # diffusers/tiny-stable-diffusion-torch quedó roto con diffusers moderno:
-    # su model_index declara `safety_checker` pero el repo no tiene esa carpeta,
-    # así que el loader la busca en la raíz del snapshot y muere con "no file
-    # named pytorch_model.bin ... found in directory <snapshot>". Éste es el
-    # repo de test que mantiene diffusers y carga bien en 0.36.
-    repo: "hf-internal-testing/tiny-stable-diffusion-torch"
-    mode: image
-    pipeline: sd15
-    dtype: float32
-    steps: 4
-    guidance_scale: 7.5
-    max_side: 64
-    vram_gb: 2
-    family: sd
-    notes: ""
   SD-1.5:
     key: "SD-1.5"
     label: "Stable Diffusion 1.5 (imagen real, ligera)"
@@ -47,7 +28,21 @@ models:
     max_side: 512
     vram_gb: 4
     family: sd
-    notes: ""
+    notes: "3060, 4060, 5050 e Intel Arc: 512 px en fp16"
+  SD-Turbo:
+    key: "SD-Turbo"
+    label: "SD Turbo (imagen en 1-4 pasos)"
+    engine: diffusers
+    repo: "stabilityai/sd-turbo"
+    mode: image
+    pipeline: sd15
+    dtype: float16
+    steps: 4
+    guidance_scale: 0.0
+    max_side: 512
+    vram_gb: 4
+    family: sd
+    notes: "iGPU/CPU (Ryzen, Intel integrada): 512 px en 4 pasos"
   SDXL-Turbo:
     key: "SDXL-Turbo"
     label: "SDXL Turbo (imagen real, 1-2 pasos)"
@@ -61,7 +56,7 @@ models:
     max_side: 512
     vram_gb: 8
     family: sdxl
-    notes: ""
+    notes: "8 GB en adelante: 512 px en 2 pasos"
   SDXL-Base:
     key: "SDXL-Base"
     label: "SDXL Base 1.0 (imagen HQ)"
@@ -89,7 +84,7 @@ models:
     max_side: 1024
     vram_gb: 16
     family: flux
-    notes: ""
+    notes: "12 GB; en 8 GB solo con NF4/offload"
   FLUX.1-dev:
     key: "FLUX.1-dev"
     label: "FLUX.1 dev (imagen HQ)"
@@ -165,7 +160,7 @@ models:
     # a 4-bit (pico real en VRAM) alcanza de sobra en la T4 de Colab.
     vram_gb: 6
     family: wan
-    notes: ""
+    notes: "8 GB: TE 4-bit + VAE fp32 (pico medido 7,69 GB)"
   Wan2.1-T2V-14B:
     key: "Wan2.1-T2V-14B"
     label: "Wan 2.1 Video (14B High Quality)"
@@ -312,50 +307,8 @@ models:
     notes: ""
 
   # ==================================================================
-  # TTS / MÚSICA — engines dedicados (fase siguiente del worker)
+  # MÚSICA — vía bridge V1 (código propietario, no corre local)
   # ==================================================================
-  Chatterbox-TTS:
-    key: "Chatterbox-TTS"
-    label: "Chatterbox TTS (voz, clonación por referencia)"
-    engine: mock
-    repo: null
-    mode: tts
-    pipeline: tts
-    dtype: null
-    steps: null
-    guidance_scale: null
-    max_side: null
-    vram_gb: 6
-    family: tts
-    notes: "engine dedicado en fase 2 del worker"
-  IndexTTS2:
-    key: "IndexTTS2"
-    label: "IndexTTS2 (voz emocional)"
-    engine: mock
-    repo: null
-    mode: tts
-    pipeline: tts
-    dtype: null
-    steps: null
-    guidance_scale: null
-    max_side: null
-    vram_gb: 8
-    family: tts
-    notes: ""
-  ACE-Step-Music:
-    key: "ACE-Step-Music"
-    label: "ACE-Step (música por prompt/letra)"
-    engine: mock
-    repo: null
-    mode: audio
-    pipeline: music
-    dtype: null
-    steps: null
-    guidance_scale: null
-    max_side: null
-    vram_gb: 10
-    family: music
-    notes: ""
   YuE2-Music:
     key: "YuE2-Music"
     label: "YuE2 (música completa con voz, vía bridge V1)"
